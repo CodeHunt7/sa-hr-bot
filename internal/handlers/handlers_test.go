@@ -36,6 +36,7 @@ type fakeContext struct {
 	sender *tele.User
 	text   string
 	args   []string
+	data   string
 
 	sent         []string
 	sentDocs     []*tele.Document
@@ -46,6 +47,7 @@ type fakeContext struct {
 func (f *fakeContext) Sender() *tele.User { return f.sender }
 func (f *fakeContext) Text() string       { return f.text }
 func (f *fakeContext) Args() []string     { return f.args }
+func (f *fakeContext) Data() string       { return f.data }
 
 func (f *fakeContext) Send(what interface{}, _ ...interface{}) error {
 	switch v := what.(type) {
@@ -244,6 +246,31 @@ func (r *fakeRepo) SetQualificationFields(_ context.Context, sessionID int64, cu
 	return nil
 }
 
+func (r *fakeRepo) SetQualificationAnswer(_ context.Context, sessionID int64, step int, answer string) error {
+	r.maybePanic()
+	s, ok := r.sessions[sessionID]
+	if !ok {
+		return errors.New("session not found")
+	}
+	if s.QualificationStep != step {
+		return errors.New("unexpected qualification step")
+	}
+	switch step {
+	case db.QualificationStepGrade:
+		s.Grade = answer
+	case db.QualificationStepDirection:
+		s.Direction = answer
+	case db.QualificationStepExperience:
+		s.Experience = answer
+	case db.QualificationStepInterviewTarget:
+		s.InterviewTarget = answer
+	default:
+		return errors.New("invalid qualification step")
+	}
+	s.QualificationStep++
+	return nil
+}
+
 func (r *fakeRepo) SetWeakTopics(_ context.Context, sessionID int64, topics string) error {
 	r.maybePanic()
 	s, ok := r.sessions[sessionID]
@@ -304,6 +331,7 @@ type fakeLLM struct {
 
 	lastEvalQuestion             *db.QuestionBank
 	lastPickGrade, lastPickTopic string
+	lastReplyContext             string
 }
 
 func (f *fakeLLM) nextReply() *llm.Reply {
@@ -315,7 +343,8 @@ func (f *fakeLLM) nextReply() *llm.Reply {
 	return &llm.Reply{Text: text}
 }
 
-func (f *fakeLLM) Reply(_ context.Context, _ string) (*llm.Reply, error) {
+func (f *fakeLLM) Reply(_ context.Context, userMessage string) (*llm.Reply, error) {
+	f.lastReplyContext = userMessage
 	return f.nextReply(), nil
 }
 
@@ -338,7 +367,12 @@ func (f *fakeLLM) PickQuestion(_ context.Context, grade, topic string) (*db.Ques
 
 func TestFullSessionFlow(t *testing.T) {
 	repo := newFakeRepo("SA2026-TEST")
-	lm := &fakeLLM{question: &db.QuestionBank{ID: 1, QuestionText: "q", Grade: "мидл", Topic: "бд"}}
+	question := &db.QuestionBank{
+		ID: 1, QuestionText: "q", Grade: "мидл", Topic: "бд",
+		AnswerJunior: "junior answer", AnswerMiddle: "middle answer", AnswerSenior: "senior answer",
+	}
+	repo.questions[question.ID] = question
+	lm := &fakeLLM{question: question}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := New(repo, lm, logger, 2, nil) // small cycle limit keeps the test short
 
@@ -357,15 +391,14 @@ func TestFullSessionFlow(t *testing.T) {
 		t.Fatalf("student should not exist after an invalid code")
 	}
 
-	// Valid code: registers, starts a session, sends the phase 0
-	// instruction, and lands in QUALIFICATION.
-	lm.replies = []string{"Инструкция фазы 0"}
+	// Valid code: registers, sends the fixed instruction and grade question,
+	// then lands in deterministic QUALIFICATION without calling the model.
 	startCtx := newCtx(telegramID, "/start SA2026-TEST", "SA2026-TEST")
 	if err := h.handleStart(startCtx); err != nil {
 		t.Fatalf("handleStart: %v", err)
 	}
-	if len(startCtx.sent) != 1 || startCtx.sent[0] != "Инструкция фазы 0" {
-		t.Fatalf("unexpected instruction message: %v", startCtx.sent)
+	if len(startCtx.sent) != 2 || startCtx.sent[0] != instructionMessage || startCtx.sent[1] != gradeQuestion {
+		t.Fatalf("unexpected initial messages: %v", startCtx.sent)
 	}
 	session, err := repo.GetActiveSession(ctx, telegramID)
 	if err != nil {
@@ -375,98 +408,80 @@ func TestFullSessionFlow(t *testing.T) {
 		t.Fatalf("expected QUALIFICATION after instruction, got %s", session.Status)
 	}
 
-	// Qualification: transitions as soon as all four fields are known,
-	// not on a fixed turn count. The model reveals one field per turn
-	// here; after 3 turns, 3 of 4 are known and the FSM must stay put.
-	lm.replies = []string{
-		"Какой у тебя грейд сейчас?\nCURRENT_GRADE: джун",
-		"На какой грейд претендуешь?\nTARGET_GRADE: мидл",
-		"Что хочешь получить от тренировки?\nREQUEST: подготовиться к собеседованию в Т-Банк",
+	// Grade is chosen explicitly, then the remaining answers are stored
+	// verbatim one by one. No reply markers or model calls are involved.
+	gradeCtx := newCtx(telegramID, "")
+	gradeCtx.data = "мидл"
+	if err := h.handleGradeCallback(gradeCtx); err != nil {
+		t.Fatalf("handleGradeCallback: %v", err)
 	}
-	for i := 0; i < 3; i++ {
-		if err := h.handleMessage(newCtx(telegramID, "ответ на квалификацию")); err != nil {
-			t.Fatalf("handleMessage qualification turn %d: %v", i, err)
-		}
-	}
-	session, _ = repo.GetActiveSession(ctx, telegramID)
-	if session.Status != db.SessionStatusQualification || session.CycleCount != 3 {
-		t.Fatalf("expected QUALIFICATION cycle_count=3, got status=%s count=%d", session.Status, session.CycleCount)
-	}
-	if session.CurrentGrade != "джун" || session.Grade != "мидл" || session.StudentRequest == "" {
-		t.Fatalf("expected 3 of 4 fields captured, got %+v", session)
+	if len(gradeCtx.sent) != 1 || gradeCtx.sent[0] != directionQuestion {
+		t.Fatalf("expected direction question, got %v", gradeCtx.sent)
 	}
 
-	// 4th turn: the model reveals the last missing field
-	// (SELF_ASSESSMENT), so the FSM must move to AUDIT right away, well
-	// under the emergency cap of 6.
-	lm.replies = []string{"Понял тебя.\nSELF_ASSESSMENT: хорошо знает БД, слабо в интеграциях"}
-	qualDoneCtx := newCtx(telegramID, "последний ответ квалификации")
+	directionCtx := newCtx(telegramID, "Финтех и банковские продукты")
+	if err := h.handleMessage(directionCtx); err != nil {
+		t.Fatalf("direction answer: %v", err)
+	}
+	if len(directionCtx.sent) != 1 || directionCtx.sent[0] != experienceQuestion {
+		t.Fatalf("expected experience question, got %v", directionCtx.sent)
+	}
+
+	experienceCtx := newCtx(telegramID, "Есть требования и UML, почти нет Kafka и сложных интеграций")
+	if err := h.handleMessage(experienceCtx); err != nil {
+		t.Fatalf("experience answer: %v", err)
+	}
+	if len(experienceCtx.sent) != 1 || experienceCtx.sent[0] != targetQuestion {
+		t.Fatalf("expected interview target question, got %v", experienceCtx.sent)
+	}
+
+	session, _ = repo.GetActiveSession(ctx, telegramID)
+	if session.Status != db.SessionStatusQualification || session.QualificationStep != db.QualificationStepInterviewTarget {
+		t.Fatalf("expected QUALIFICATION at interview target step, got status=%s step=%d", session.Status, session.QualificationStep)
+	}
+	if session.Grade != "мидл" || session.Direction == "" || session.Experience == "" {
+		t.Fatalf("expected first 3 qualification answers captured, got %+v", session)
+	}
+
+	// The fourth answer immediately triggers audit and the first bank
+	// question. No extra "готов" message is required between phases.
+	lm.replies = []string{"▸ МИНИ-АУДИТ\nВероятно, слабое место: интеграции. Проверим на практике.\nWEAK_TOPICS: интеграции,бд"}
+	qualDoneCtx := newCtx(telegramID, "Собеседование в пятницу")
 	if err := h.handleMessage(qualDoneCtx); err != nil {
-		t.Fatalf("handleMessage qualification turn 4: %v", err)
+		t.Fatalf("interview target answer: %v", err)
 	}
-	if len(qualDoneCtx.sent) != 1 ||
-		strings.Contains(qualDoneCtx.sent[0], "SELF_ASSESSMENT:") ||
-		strings.Contains(qualDoneCtx.sent[0], "CURRENT_GRADE:") {
-		t.Fatalf("expected markers stripped from the message shown to the student, got %q", qualDoneCtx.sent)
+	if len(qualDoneCtx.sent) != 2 {
+		t.Fatalf("expected audit and first question, got %v", qualDoneCtx.sent)
 	}
-	session, _ = repo.GetActiveSession(ctx, telegramID)
-	if session.Status != db.SessionStatusAudit {
-		t.Fatalf("expected AUDIT as soon as all 4 fields are known (turn 4, cap is 6), got %s", session.Status)
+	if !strings.Contains(qualDoneCtx.sent[0], "МИНИ-АУДИТ") || strings.Contains(qualDoneCtx.sent[0], "WEAK_TOPICS") {
+		t.Fatalf("expected cleaned mini-audit, got %q", qualDoneCtx.sent[0])
 	}
-	if session.CurrentGrade != "джун" || session.Grade != "мидл" ||
-		session.StudentRequest == "" || session.SelfAssessment == "" {
-		t.Fatalf("expected all 4 qualification fields captured, got %+v", session)
-	}
-
-	// Seed the question bank fake so GetQuestionByID can resolve the
-	// question PickQuestion hands out, with real reference answers to
-	// verify Evaluate receives the actual asked question, not a fresh
-	// random pick.
-	repo.questions[1] = &db.QuestionBank{
-		ID: 1, QuestionText: "q", Grade: "мидл", Topic: "бд",
-		AnswerJunior: "junior answer", AnswerMiddle: "middle answer", AnswerSenior: "senior answer",
-	}
-
-	// Audit: cap is 1, a single message moves straight to QUESTION_CYCLE.
-	// The reply also flags weak topics, which must end up as a priority
-	// filter for PickQuestion once the question cycle starts.
-	lm.replies = []string{"▸ МИНИ-АУДИТ\n...\nWEAK_TOPICS: бд,интеграции"}
-	auditCtx := newCtx(telegramID, "ок")
-	if err := h.handleMessage(auditCtx); err != nil {
-		t.Fatalf("handleMessage audit: %v", err)
-	}
-	if len(auditCtx.sent) != 1 || strings.Contains(auditCtx.sent[0], "WEAK_TOPICS") {
-		t.Fatalf("expected WEAK_TOPICS marker stripped from the audit message, got %q", auditCtx.sent)
+	if qualDoneCtx.sent[1] != "q" {
+		t.Fatalf("expected first bank question immediately after audit, got %q", qualDoneCtx.sent[1])
 	}
 	session, _ = repo.GetActiveSession(ctx, telegramID)
 	if session.Status != db.SessionStatusQuestionCycle {
-		t.Fatalf("expected QUESTION_CYCLE after audit, got %s", session.Status)
+		t.Fatalf("expected QUESTION_CYCLE after automatic audit, got %s", session.Status)
 	}
-	if session.CurrentQuestionID != nil {
-		t.Fatalf("expected no current question right after entering QUESTION_CYCLE, got %v", session.CurrentQuestionID)
+	if session.QualificationStep != db.QualificationStepDone || session.InterviewTarget != "Собеседование в пятницу" {
+		t.Fatalf("expected all qualification answers captured, got %+v", session)
 	}
-	if session.WeakTopics != "бд,интеграции" {
-		t.Fatalf("expected weak_topics captured from the audit reply, got %q", session.WeakTopics)
+	if session.WeakTopics != "интеграции,бд" {
+		t.Fatalf("expected audit topics stored, got %q", session.WeakTopics)
 	}
-
-	// First message in the cycle: no question asked yet, so the bot
-	// picks one and sends it as-is, without calling the model at all.
-	askCtx := newCtx(telegramID, "готов")
-	if err := h.handleMessage(askCtx); err != nil {
-		t.Fatalf("handleMessage ask question 1: %v", err)
+	for _, want := range []string{"мидл", "Финтех и банковские продукты", "Есть требования и UML", "Собеседование в пятницу"} {
+		if !strings.Contains(lm.lastReplyContext, want) {
+			t.Fatalf("audit context must contain %q, got:\n%s", want, lm.lastReplyContext)
+		}
 	}
-	if len(askCtx.sent) != 1 || askCtx.sent[0] != "q" {
-		t.Fatalf("expected the raw bank question to be sent, got %v", askCtx.sent)
-	}
-	session, _ = repo.GetActiveSession(ctx, telegramID)
 	if session.CurrentQuestionID == nil || *session.CurrentQuestionID != 1 {
 		t.Fatalf("expected current_question_id=1, got %v", session.CurrentQuestionID)
 	}
 	if session.CycleCount != 0 {
 		t.Fatalf("expected cycle_count still 0 before any answer is graded, got %d", session.CycleCount)
 	}
-	if lm.lastPickTopic != "бд" {
-		t.Fatalf("expected PickQuestion to be called with the first weak topic (\"бд\") as a priority filter, got %q", lm.lastPickTopic)
+	if lm.lastPickTopic != "интеграции" {
+		t.Fatalf("expected PickQuestion to use first weak topic, got %q", lm.lastPickTopic)
 	}
 	if lm.pickCalls != 1 {
 		t.Fatalf("expected 1 PickQuestion call so far, got %d", lm.pickCalls)
@@ -681,6 +696,10 @@ func TestRestartCallback_ResetsAllSessionFields(t *testing.T) {
 	dirty.SelfAssessment = "старая самооценка"
 	dirty.WeakTopics = "бд,интеграции"
 	dirty.CurrentQuestionID = &questionID
+	dirty.Direction = "старое направление"
+	dirty.Experience = "старый опыт"
+	dirty.InterviewTarget = "старая вакансия"
+	dirty.QualificationStep = db.QualificationStepInterviewTarget
 
 	lm.replies = []string{"новая инструкция"}
 	restartCtx := newCtx(telegramID, "")
@@ -718,6 +737,13 @@ func TestRestartCallback_ResetsAllSessionFields(t *testing.T) {
 	}
 	if fresh.CurrentQuestionID != nil {
 		t.Errorf("current_question_id not reset: got %v", *fresh.CurrentQuestionID)
+	}
+	if fresh.Direction != "" || fresh.Experience != "" || fresh.InterviewTarget != "" {
+		t.Errorf("new qualification fields not reset: direction=%q experience=%q target=%q",
+			fresh.Direction, fresh.Experience, fresh.InterviewTarget)
+	}
+	if fresh.QualificationStep != db.QualificationStepGrade {
+		t.Errorf("qualification_step not reset: got %d", fresh.QualificationStep)
 	}
 
 	oldAfter, err := repo.sessionByID(old.ID)
@@ -946,47 +972,48 @@ func TestReport_AdminLargeListSendsCSV(t *testing.T) {
 	}
 }
 
-func TestQualification_EmergencyCapTransitionsWithPartialFields(t *testing.T) {
+func TestQualification_InvalidGradeDoesNotAdvanceOrCallLLM(t *testing.T) {
 	repo := newFakeRepo("SA2026-TEST")
-	lm := &fakeLLM{}
+	lm := &fakeLLM{replies: []string{"this reply must stay unused"}}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := New(repo, lm, logger, 8, nil)
 
 	const telegramID = 55
 	ctx := context.Background()
 
-	lm.replies = []string{"инструкция"}
 	if err := h.handleStart(newCtx(telegramID, "/start SA2026-TEST", "SA2026-TEST")); err != nil {
 		t.Fatalf("initial start: %v", err)
 	}
 
-	// The model never manages to reveal SELF_ASSESSMENT across 6 turns.
-	lm.replies = []string{
-		"вопрос 1\nCURRENT_GRADE: джун",
-		"вопрос 2\nTARGET_GRADE: мидл",
-		"вопрос 3\nREQUEST: подготовиться",
-		"вопрос 4",
-		"вопрос 5",
-		"вопрос 6",
+	invalid := newCtx(telegramID, "архитектор")
+	if err := h.handleMessage(invalid); err != nil {
+		t.Fatalf("invalid grade: %v", err)
 	}
-	for i := 0; i < 6; i++ {
-		if err := h.handleMessage(newCtx(telegramID, "ответ")); err != nil {
-			t.Fatalf("handleMessage qualification turn %d: %v", i, err)
-		}
+	if len(invalid.sent) != 1 || !strings.Contains(invalid.sent[0], "джун, мидл или сеньор") {
+		t.Fatalf("expected a grade choice prompt, got %v", invalid.sent)
 	}
 
 	session, err := repo.GetActiveSession(ctx, telegramID)
 	if err != nil {
 		t.Fatalf("GetActiveSession: %v", err)
 	}
-	if session.Status != db.SessionStatusAudit {
-		t.Fatalf("expected the emergency cap (6) to force a transition to AUDIT, got %s", session.Status)
+	if session.Status != db.SessionStatusQualification || session.QualificationStep != db.QualificationStepGrade {
+		t.Fatalf("invalid grade must not advance qualification, got status=%s step=%d", session.Status, session.QualificationStep)
 	}
-	if session.SelfAssessment != "" {
-		t.Fatalf("expected self_assessment to still be empty, got %q", session.SelfAssessment)
+	if session.Grade != "" {
+		t.Fatalf("invalid grade must not be stored, got %q", session.Grade)
 	}
-	if session.CurrentGrade == "" || session.Grade == "" || session.StudentRequest == "" {
-		t.Fatalf("expected the 3 fields that were revealed to be captured, got %+v", session)
+	if len(lm.replies) != 1 {
+		t.Fatalf("qualification must not consume LLM replies")
+	}
+
+	valid := newCtx(telegramID, "джун")
+	if err := h.handleMessage(valid); err != nil {
+		t.Fatalf("valid text grade: %v", err)
+	}
+	session, _ = repo.GetActiveSession(ctx, telegramID)
+	if session.Grade != "джун" || session.QualificationStep != db.QualificationStepDirection {
+		t.Fatalf("valid grade should advance exactly once, got %+v", session)
 	}
 }
 
@@ -1279,6 +1306,7 @@ func TestRegister_AllEndpointsWrappedByRecovery(t *testing.T) {
 		{"/report command", "/report"},
 		{"restart callback", &btnRestart},
 		{"continue callback", &btnContinue},
+		{"grade callback", &btnGradeJunior},
 		{"text message", tele.OnText},
 	}
 

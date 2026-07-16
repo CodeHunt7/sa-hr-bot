@@ -114,14 +114,17 @@ func (r *Repository) StartSession(ctx context.Context, studentID int64) (*Sessio
 	err := r.pool.QueryRow(ctx,
 		`INSERT INTO sessions (
 		     student_id, status, cycle_count,
-		     current_grade, grade, student_request, self_assessment, weak_topics, current_question_id
+		     current_grade, grade, student_request, self_assessment, weak_topics, current_question_id,
+		     direction, experience, interview_target, qualification_step
 		 )
-		 VALUES ($1, $2, 0, '', '', '', '', '', NULL)
+		 VALUES ($1, $2, 0, '', '', '', '', '', NULL, '', '', '', 0)
 		 RETURNING id, student_id, started_at, ended_at, status, cycle_count,
-		           current_grade, grade, student_request, self_assessment, weak_topics, current_question_id`,
+		           current_grade, grade, student_request, self_assessment, weak_topics, current_question_id,
+		           direction, experience, interview_target, qualification_step`,
 		studentID, SessionStatusInstruction,
 	).Scan(&s.ID, &s.StudentID, &s.StartedAt, &s.EndedAt, &s.Status, &s.CycleCount,
-		&s.CurrentGrade, &s.Grade, &s.StudentRequest, &s.SelfAssessment, &s.WeakTopics, &s.CurrentQuestionID)
+		&s.CurrentGrade, &s.Grade, &s.StudentRequest, &s.SelfAssessment, &s.WeakTopics, &s.CurrentQuestionID,
+		&s.Direction, &s.Experience, &s.InterviewTarget, &s.QualificationStep)
 	if err != nil {
 		return nil, fmt.Errorf("start session: %w", err)
 	}
@@ -150,14 +153,16 @@ func (r *Repository) GetActiveSession(ctx context.Context, studentID int64) (*Se
 	s := &Session{}
 	err := r.pool.QueryRow(ctx,
 		`SELECT id, student_id, started_at, ended_at, status, cycle_count,
-		        current_grade, grade, student_request, self_assessment, weak_topics, current_question_id
+		        current_grade, grade, student_request, self_assessment, weak_topics, current_question_id,
+		        direction, experience, interview_target, qualification_step
 		 FROM sessions
 		 WHERE student_id = $1 AND ended_at IS NULL
 		 ORDER BY started_at DESC
 		 LIMIT 1`,
 		studentID,
 	).Scan(&s.ID, &s.StudentID, &s.StartedAt, &s.EndedAt, &s.Status, &s.CycleCount,
-		&s.CurrentGrade, &s.Grade, &s.StudentRequest, &s.SelfAssessment, &s.WeakTopics, &s.CurrentQuestionID)
+		&s.CurrentGrade, &s.Grade, &s.StudentRequest, &s.SelfAssessment, &s.WeakTopics, &s.CurrentQuestionID,
+		&s.Direction, &s.Experience, &s.InterviewTarget, &s.QualificationStep)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNoActiveSession
 	}
@@ -165,6 +170,34 @@ func (r *Repository) GetActiveSession(ctx context.Context, studentID int64) (*Se
 		return nil, fmt.Errorf("get active session: %w", err)
 	}
 	return s, nil
+}
+
+// SetQualificationAnswer stores the answer expected at step and advances the
+// deterministic qualification flow to the next step. The SQL column is chosen
+// in code rather than interpolated from user input.
+func (r *Repository) SetQualificationAnswer(ctx context.Context, sessionID int64, step int, answer string) error {
+	var query string
+	switch step {
+	case QualificationStepGrade:
+		query = `UPDATE sessions SET grade = $2, qualification_step = 1 WHERE id = $1 AND qualification_step = 0`
+	case QualificationStepDirection:
+		query = `UPDATE sessions SET direction = $2, qualification_step = 2 WHERE id = $1 AND qualification_step = 1`
+	case QualificationStepExperience:
+		query = `UPDATE sessions SET experience = $2, qualification_step = 3 WHERE id = $1 AND qualification_step = 2`
+	case QualificationStepInterviewTarget:
+		query = `UPDATE sessions SET interview_target = $2, qualification_step = 4 WHERE id = $1 AND qualification_step = 3`
+	default:
+		return fmt.Errorf("set qualification answer: invalid step %d", step)
+	}
+
+	tag, err := r.pool.Exec(ctx, query, sessionID, answer)
+	if err != nil {
+		return fmt.Errorf("set qualification answer: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("set qualification answer: session %d is not waiting for step %d", sessionID, step)
+	}
+	return nil
 }
 
 // AdvancePhase moves sessionID to newStatus, resets cycle_count to 0,

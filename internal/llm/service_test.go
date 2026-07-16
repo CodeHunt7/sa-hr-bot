@@ -266,6 +266,26 @@ func TestBuildQualificationContext_AllKnown(t *testing.T) {
 	}
 }
 
+func TestBuildAuditContext_IncludesFullQualificationProfileAndExplicitPhase(t *testing.T) {
+	profile := QualificationProfile{
+		Grade:           "мидл",
+		Direction:       "финтех",
+		Experience:      "есть требования, мало Kafka",
+		InterviewTarget: "собеседование 20 июля",
+	}
+	zones := []db.WeakZone{{ZoneText: "интеграции", Status: db.WeakZoneStatusHypothesis}}
+
+	got := BuildAuditContext(profile, zones)
+	for _, want := range []string{
+		"Фазу 2", "мидл", "финтех", "есть требования, мало Kafka",
+		"собеседование 20 июля", "интеграции: hypothesis", "WEAK_TOPICS",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("audit context does not contain %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestEvaluate_SendsQuestionAndReferenceAnswersAsContext(t *testing.T) {
 	var gotUserContent string
 
@@ -305,7 +325,10 @@ func TestEvaluate_SendsQuestionAndReferenceAnswersAsContext(t *testing.T) {
 		t.Fatalf("unexpected reply text: %q", reply.Text)
 	}
 
-	for _, want := range []string{studentAnswer, "junior-ref", "middle-ref", "senior-ref", "Что такое индекс в БД?"} {
+	for _, want := range []string{
+		studentAnswer, "junior-ref", "middle-ref", "senior-ref", "Что такое индекс в БД?",
+		"ФАЗА 3", "Не начинай квалификацию", "Не спрашивай грейд", "ответ бессмысленный",
+	} {
 		if !strings.Contains(gotUserContent, want) {
 			t.Errorf("expected the request's user message to contain %q, got:\n%s", want, gotUserContent)
 		}

@@ -35,6 +35,16 @@ type StudentProfile struct {
 	Grade string // target grade, e.g. "джун", "джун-мидл", "мидл", "мидл-сеньор", "сеньор"
 }
 
+// QualificationProfile contains the four answers collected by the
+// deterministic qualification flow. Unlike the old marker-based flow, these
+// values are stored verbatim and passed together to the audit call.
+type QualificationProfile struct {
+	Grade           string
+	Direction       string
+	Experience      string
+	InterviewTarget string
+}
+
 // Turn is one message in the recent dialog history.
 type Turn struct {
 	Role    string // "user" or "assistant"
@@ -164,6 +174,32 @@ func BuildUserContext(profile StudentProfile, weakZones []db.WeakZone, recentTur
 	return b.String()
 }
 
+// BuildAuditContext explicitly tells the model to run phase 2 and supplies all
+// qualification answers. The phase must be explicit because the service does
+// not replay the full Telegram conversation on every call.
+func BuildAuditContext(profile QualificationProfile, weakZones []db.WeakZone) string {
+	var b strings.Builder
+
+	b.WriteString("Текущая задача: выполни Фазу 2, МИНИ-АУДИТ. Инструкцию и вопросы квалификации не повторяй.\n\n")
+	b.WriteString("Ответы квалификации:\n")
+	fmt.Fprintf(&b, "- Грейд: %s\n", profile.Grade)
+	fmt.Fprintf(&b, "- Направление и индустрия: %s\n", profile.Direction)
+	fmt.Fprintf(&b, "- Реальный опыт и пробелы: %s\n", profile.Experience)
+	fmt.Fprintf(&b, "- Вакансия или дата собеседования: %s\n", profile.InterviewTarget)
+
+	b.WriteString("\nТекущая карта слабых зон:\n")
+	if len(weakZones) == 0 {
+		b.WriteString("(пока пусто)\n")
+	} else {
+		for _, wz := range weakZones {
+			fmt.Fprintf(&b, "- %s: %s\n", wz.ZoneText, wz.Status)
+		}
+	}
+
+	b.WriteString("\nСформулируй 2-4 гипотезы и оформи их в рамке МИНИ-АУДИТ. В конце добавь WEAK_TOPICS по правилам системного промпта.\n")
+	return b.String()
+}
+
 // QualificationKnown is what has already been extracted for the current
 // session's four QUALIFICATION fields (see prompts/system_prompt.md's
 // "Технические метки" section). An empty field means it is still
@@ -247,17 +283,23 @@ func BuildQualificationContext(known QualificationKnown, weakZones []db.WeakZone
 	return b.String()
 }
 
-// Evaluate grades studentAnswer against question's reference answers
-// (answer_junior/middle/senior) and follow-ups, folded into context via
-// BuildUserContext exactly like any other turn. Call it whenever the
-// incoming message is a response to a specific, already-known bank
-// question (sessions.current_question_id is set) rather than relying on
-// the model's own memory of which question it asked: the compact
-// per-call context (see BuildUserContext) does not carry prior turns
-// far enough back for that to be reliable.
+// BuildEvaluationContext pins the model to phase 3. Without this explicit
+// instruction, a short or nonsensical candidate answer can make the model
+// incorrectly restart phase 0 or qualification from the large system prompt.
+func BuildEvaluationContext(profile StudentProfile, weakZones []db.WeakZone, studentAnswer string, question *db.QuestionBank) string {
+	var b strings.Builder
+	b.WriteString("Текущая задача: ФАЗА 3, оцени ответ кандидата на уже заданный технический вопрос.\n")
+	b.WriteString("Не повторяй инструкцию. Не начинай квалификацию. Не спрашивай грейд, направление, опыт или дату собеседования.\n")
+	b.WriteString("Даже если ответ бессмысленный, грубый или не относится к вопросу, оставайся в Фазе 3. Прямо скажи, что ответ не раскрывает тему, и кратко объясни, чего не хватило.\n")
+	b.WriteString("Для текущей минимальной версии верни только одну рамку `▸ ОБРАТНАЯ СВЯЗЬ`. Не задавай следующий вопрос и не начинай новую фазу: следующий вопрос отправит код.\n\n")
+	b.WriteString(BuildUserContext(profile, weakZones, []Turn{{Role: "user", Content: studentAnswer}}, question))
+	return b.String()
+}
+
+// Evaluate grades studentAnswer against question's reference answers while
+// explicitly keeping the model in phase 3.
 func (s *Service) Evaluate(ctx context.Context, profile StudentProfile, weakZones []db.WeakZone, studentAnswer string, question *db.QuestionBank) (*Reply, error) {
-	turns := []Turn{{Role: "user", Content: studentAnswer}}
-	return s.Reply(ctx, BuildUserContext(profile, weakZones, turns, question))
+	return s.Reply(ctx, BuildEvaluationContext(profile, weakZones, studentAnswer, question))
 }
 
 // Reply sends the stable system prompt together with userMessage to the

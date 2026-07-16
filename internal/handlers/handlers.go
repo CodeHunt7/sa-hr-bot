@@ -27,21 +27,8 @@ import (
 // process itself needs to track, and they live in sessions.cycle_count,
 // reset to 0 on every phase transition (see db.Repository.AdvancePhase).
 const (
-	// qualificationTurnCap is an emergency ceiling on phase 1: normally
-	// the FSM leaves QUALIFICATION as soon as all four fields (current
-	// grade, target grade, request, self-assessment) are known, checked
-	// after every turn. This cap only fires if the model never manages
-	// to extract one of them, so the session doesn't get stuck asking
-	// forever; AUDIT then runs with whatever is known.
-	qualificationTurnCap = 6
-
-	// auditTurnCap is 1: phase 2 is a single message (the mini-audit
-	// frame), then the FSM moves on to the question cycle.
-	auditTurnCap = 1
-
 	// fallbackGrade is used if QUESTION_CYCLE starts without a grade
-	// captured during qualification (the model didn't emit a GRADE:
-	// marker). It degrades PickQuestion to a mid-level default instead
+	// captured during qualification. It degrades PickQuestion to a mid-level default instead
 	// of failing the session outright.
 	fallbackGrade = "мидл"
 
@@ -58,6 +45,14 @@ const (
 )
 
 const genericErrorMessage = "Что-то сломалось на моей стороне. Попробуй написать еще раз через минуту."
+
+const (
+	instructionMessage = "Сначала я задам четыре коротких вопроса, чтобы понять твой уровень и опыт. Затем покажу мини-аудит вероятных слабых зон. После этого начнем разбирать технические вопросы с обратной связью и уточнениями."
+	gradeQuestion      = "На какой грейд ты претендуешь или сейчас себя ощущаешь?"
+	directionQuestion  = "В каком направлении и индустрии у тебя основной опыт или куда хочешь перейти?"
+	experienceQuestion = "В каких задачах у тебя есть реальный опыт, а в каких его почти нет? Например: требования, интеграции, БД, UML, документация, тест-кейсы."
+	targetQuestion     = "Есть конкретная вакансия или дата собеседования, к которому готовишься? Если нет, так и напиши."
+)
 
 // qualificationMarkerRE matches the CURRENT_GRADE:/TARGET_GRADE:/
 // REQUEST:/SELF_ASSESSMENT: marker lines the model appends during
@@ -110,10 +105,16 @@ var (
 	restartMenu = &tele.ReplyMarkup{}
 	btnRestart  = restartMenu.Data("Начать заново", "restart_session")
 	btnContinue = restartMenu.Data("Продолжить", "continue_session")
+
+	gradeMenu      = &tele.ReplyMarkup{}
+	btnGradeJunior = gradeMenu.Data("Джун", "qualification_grade", "джун")
+	btnGradeMiddle = gradeMenu.Data("Мидл", "qualification_grade", "мидл")
+	btnGradeSenior = gradeMenu.Data("Сеньор", "qualification_grade", "сеньор")
 )
 
 func init() {
 	restartMenu.Inline(restartMenu.Row(btnRestart, btnContinue))
+	gradeMenu.Inline(gradeMenu.Row(btnGradeJunior, btnGradeMiddle, btnGradeSenior))
 }
 
 // Repository is the subset of db.Repository this package depends on.
@@ -125,7 +126,7 @@ type Repository interface {
 	EndSession(ctx context.Context, sessionID int64, status string) error
 	AdvancePhase(ctx context.Context, sessionID int64, newStatus string) error
 	IncrementCycleCount(ctx context.Context, sessionID int64) (int, error)
-	SetQualificationFields(ctx context.Context, sessionID int64, currentGrade, targetGrade, studentRequest, selfAssessment string) error
+	SetQualificationAnswer(ctx context.Context, sessionID int64, step int, answer string) error
 	SetWeakTopics(ctx context.Context, sessionID int64, topics string) error
 	SetCurrentQuestionID(ctx context.Context, sessionID int64, questionID *int64) error
 	GetQuestionByID(ctx context.Context, id int64) (*db.QuestionBank, error)
@@ -191,6 +192,7 @@ func (h *Handler) Register(bot *tele.Bot) {
 	h.handle(bot, "/report", h.handleReport)
 	h.handle(bot, &btnRestart, h.handleRestartCallback)
 	h.handle(bot, &btnContinue, h.handleContinueCallback)
+	h.handle(bot, &btnGradeJunior, h.handleGradeCallback)
 	h.handle(bot, tele.OnText, h.handleMessage)
 }
 
@@ -414,9 +416,9 @@ func (h *Handler) registerAndStart(ctx context.Context, c tele.Context, telegram
 	return h.startFreshSession(ctx, c, student)
 }
 
-// startFreshSession creates a new session and immediately sends the
-// phase 0 instruction message, then advances the FSM to QUALIFICATION
-// so the student's next message is handled as a qualification answer.
+// startFreshSession creates a new session, sends the fixed phase 0
+// instruction once, then starts deterministic qualification with a grade
+// choice. The model is deliberately not involved in either action.
 func (h *Handler) startFreshSession(ctx context.Context, c tele.Context, student *db.Student) error {
 	session, err := h.repo.StartSession(ctx, student.TelegramID)
 	if err != nil {
@@ -424,28 +426,53 @@ func (h *Handler) startFreshSession(ctx context.Context, c tele.Context, student
 		return c.Send(genericErrorMessage)
 	}
 
-	reply, err := h.llm.Reply(ctx, llm.BuildUserContext(llm.StudentProfile{}, nil, nil, nil))
-	if err != nil {
-		h.logger.Error("llm reply (instruction)", "error", err, "session_id", session.ID)
-		return c.Send(genericErrorMessage)
-	}
-
-	// Phase 0 has no business emitting qualification markers (see
-	// prompts/system_prompt.md), and this message never reaches
-	// SetQualificationFields either way, but strip them anyway: seen in
-	// practice, the model occasionally writes them out with a
-	// placeholder value like "неизвестно" regardless, which would
-	// otherwise leak raw marker lines straight into the student's
-	// welcome message.
-	_, _, _, _, cleaned := extractQualificationMarkers(reply.Text)
-	if err := c.Send(cleaned); err != nil {
+	if err := c.Send(instructionMessage); err != nil {
 		return err
 	}
 
 	if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusQualification); err != nil {
 		h.logger.Error("advance phase", "error", err, "session_id", session.ID)
+		return c.Send(genericErrorMessage)
 	}
-	return nil
+	return c.Send(gradeQuestion, gradeMenu)
+}
+
+// handleGradeCallback stores the explicit grade button choice and advances to
+// the second qualification question. Text grade answers are also accepted by
+// handleQualification for accessibility and recovery.
+func (h *Handler) handleGradeCallback(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		h.logger.Warn("respond callback", "error", err)
+	}
+
+	ctx := context.Background()
+	student, err := h.repo.GetStudentByTelegramID(ctx, senderID(c))
+	if errors.Is(err, db.ErrStudentNotFound) {
+		return c.Send("Похоже, ты еще не зарегистрирован. Напиши /start и код доступа, который тебе прислали.")
+	}
+	if err != nil {
+		h.logger.Error("get student", "error", err)
+		return c.Send(genericErrorMessage)
+	}
+
+	session, err := h.repo.GetActiveSession(ctx, student.TelegramID)
+	if err != nil {
+		h.logger.Error("get active session", "error", err)
+		return c.Send(genericErrorMessage)
+	}
+	if session.Status != db.SessionStatusQualification || session.QualificationStep != db.QualificationStepGrade {
+		return c.Send("Этот выбор уже сохранён. Продолжаем с текущего шага.")
+	}
+
+	grade, ok := normalizeGrade(c.Data())
+	if !ok {
+		return c.Send("Выбери грейд кнопкой: джун, мидл или сеньор.", gradeMenu)
+	}
+	if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepGrade, grade); err != nil {
+		h.logger.Error("set qualification grade", "error", err, "session_id", session.ID)
+		return c.Send(genericErrorMessage)
+	}
+	return c.Send(directionQuestion)
 }
 
 // handleRestartCallback ends the student's active session as abandoned
@@ -562,74 +589,81 @@ func (h *Handler) handleMessage(c tele.Context) error {
 	}
 }
 
-// handleQualification runs phase 1: gather current grade, target grade,
-// the student's request for the session, and a self-assessment of
-// strong/weak areas. Every turn parses whichever of those four fields
-// the reply's markers reveal, saves them, and transitions to AUDIT as
-// soon as all four are known, not on a fixed turn count.
-// qualificationTurnCap is only an emergency backstop in case the model
-// never manages to pin one field down.
+// handleQualification runs the fixed four-question qualification flow. Each
+// incoming answer is saved verbatim in the column for the current step; the
+// model neither extracts fields nor chooses the next question.
 func (h *Handler) handleQualification(ctx context.Context, c tele.Context, student *db.Student, session *db.Session) error {
-	weakZones, err := h.repo.GetWeakZones(ctx, student.TelegramID)
-	if err != nil {
-		h.logger.Error("get weak zones", "error", err, "session_id", session.ID)
+	answer := strings.TrimSpace(c.Text())
+	if answer == "" {
+		return c.Send("Нужен текстовый ответ, чтобы я мог продолжить.")
+	}
+
+	switch session.QualificationStep {
+	case db.QualificationStepGrade:
+		grade, ok := normalizeGrade(answer)
+		if !ok {
+			return c.Send("Выбери грейд: джун, мидл или сеньор.", gradeMenu)
+		}
+		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepGrade, grade); err != nil {
+			return h.qualificationSaveError(c, session.ID, err)
+		}
+		return c.Send(directionQuestion)
+
+	case db.QualificationStepDirection:
+		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepDirection, answer); err != nil {
+			return h.qualificationSaveError(c, session.ID, err)
+		}
+		return c.Send(experienceQuestion)
+
+	case db.QualificationStepExperience:
+		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepExperience, answer); err != nil {
+			return h.qualificationSaveError(c, session.ID, err)
+		}
+		return c.Send(targetQuestion)
+
+	case db.QualificationStepInterviewTarget:
+		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepInterviewTarget, answer); err != nil {
+			return h.qualificationSaveError(c, session.ID, err)
+		}
+		session.InterviewTarget = answer
+		session.QualificationStep = db.QualificationStepDone
+		if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusAudit); err != nil {
+			h.logger.Error("advance phase", "error", err, "session_id", session.ID)
+			return c.Send(genericErrorMessage)
+		}
+		session.Status = db.SessionStatusAudit
+		return h.runAuditAndStartQuestion(ctx, c, student, session)
+
+	case db.QualificationStepDone:
+		if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusAudit); err != nil {
+			h.logger.Error("advance completed qualification to audit", "error", err, "session_id", session.ID)
+			return c.Send(genericErrorMessage)
+		}
+		session.Status = db.SessionStatusAudit
+		return h.runAuditAndStartQuestion(ctx, c, student, session)
+
+	default:
+		h.logger.Error("unexpected qualification step", "step", session.QualificationStep, "session_id", session.ID)
 		return c.Send(genericErrorMessage)
 	}
+}
 
-	known := llm.QualificationKnown{
-		CurrentGrade:   session.CurrentGrade,
-		TargetGrade:    session.Grade,
-		StudentRequest: session.StudentRequest,
-		SelfAssessment: session.SelfAssessment,
-	}
+func (h *Handler) qualificationSaveError(c tele.Context, sessionID int64, err error) error {
+	h.logger.Error("set qualification answer", "error", err, "session_id", sessionID)
+	return c.Send(genericErrorMessage)
+}
 
-	reply, err := h.llm.Reply(ctx, llm.BuildQualificationContext(known, weakZones, c.Text()))
-	if err != nil {
-		h.logger.Error("llm reply", "error", err, "session_id", session.ID, "status", session.Status)
-		return c.Send(genericErrorMessage)
+func normalizeGrade(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "джун", "джуниор", "junior":
+		return "джун", true
+	case "мидл", "middle":
+		return "мидл", true
+	case "сеньор", "сениор", "senior":
+		return "сеньор", true
+	default:
+		return "", false
 	}
-
-	currentGrade, targetGrade, request, selfAssessment, cleaned := extractQualificationMarkers(reply.Text)
-	if currentGrade != "" || targetGrade != "" || request != "" || selfAssessment != "" {
-		if err := h.repo.SetQualificationFields(ctx, session.ID, currentGrade, targetGrade, request, selfAssessment); err != nil {
-			h.logger.Error("set qualification fields", "error", err, "session_id", session.ID)
-		}
-		// Reflect locally so the "all four known" check below sees this
-		// turn's newly extracted values without a re-read from the DB.
-		if currentGrade != "" {
-			session.CurrentGrade = currentGrade
-		}
-		if targetGrade != "" {
-			session.Grade = targetGrade
-		}
-		if request != "" {
-			session.StudentRequest = request
-		}
-		if selfAssessment != "" {
-			session.SelfAssessment = selfAssessment
-		}
-	}
-
-	if err := c.Send(cleaned); err != nil {
-		return err
-	}
-
-	count, err := h.repo.IncrementCycleCount(ctx, session.ID)
-	if err != nil {
-		h.logger.Error("increment cycle count", "error", err, "session_id", session.ID)
-		return nil // the reply already went out; don't fail the update over bookkeeping
-	}
-
-	allKnown := session.CurrentGrade != "" && session.Grade != "" &&
-		session.StudentRequest != "" && session.SelfAssessment != ""
-	if !allKnown && count < qualificationTurnCap {
-		return nil
-	}
-
-	if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusAudit); err != nil {
-		h.logger.Error("advance phase", "error", err, "session_id", session.ID)
-	}
-	return nil
 }
 
 // handleAudit runs phase 2: present the mini-audit frame. It is a single
@@ -637,16 +671,24 @@ func (h *Handler) handleQualification(ctx context.Context, c tele.Context, stude
 // reply's WEAK_TOPICS marker is parsed and saved as a priority topic
 // filter for QUESTION_CYCLE's PickQuestion calls.
 func (h *Handler) handleAudit(ctx context.Context, c tele.Context, student *db.Student, session *db.Session) error {
+	return h.runAuditAndStartQuestion(ctx, c, student, session)
+}
+
+func (h *Handler) runAuditAndStartQuestion(ctx context.Context, c tele.Context, student *db.Student, session *db.Session) error {
 	weakZones, err := h.repo.GetWeakZones(ctx, student.TelegramID)
 	if err != nil {
 		h.logger.Error("get weak zones", "error", err, "session_id", session.ID)
 		return c.Send(genericErrorMessage)
 	}
 
-	profile := llm.StudentProfile{Grade: session.Grade}
-	turns := []llm.Turn{{Role: "user", Content: c.Text()}}
+	profile := llm.QualificationProfile{
+		Grade:           session.Grade,
+		Direction:       session.Direction,
+		Experience:      session.Experience,
+		InterviewTarget: session.InterviewTarget,
+	}
 
-	reply, err := h.llm.Reply(ctx, llm.BuildUserContext(profile, weakZones, turns, nil))
+	reply, err := h.llm.Reply(ctx, llm.BuildAuditContext(profile, weakZones))
 	if err != nil {
 		h.logger.Error("llm reply", "error", err, "session_id", session.ID, "status", session.Status)
 		return c.Send(genericErrorMessage)
@@ -654,7 +696,8 @@ func (h *Handler) handleAudit(ctx context.Context, c tele.Context, student *db.S
 
 	topics, cleaned := extractWeakTopics(reply.Text)
 	if len(topics) > 0 {
-		if err := h.repo.SetWeakTopics(ctx, session.ID, strings.Join(topics, ",")); err != nil {
+		session.WeakTopics = strings.Join(topics, ",")
+		if err := h.repo.SetWeakTopics(ctx, session.ID, session.WeakTopics); err != nil {
 			h.logger.Error("set weak topics", "error", err, "session_id", session.ID)
 		}
 	}
@@ -663,19 +706,13 @@ func (h *Handler) handleAudit(ctx context.Context, c tele.Context, student *db.S
 		return err
 	}
 
-	count, err := h.repo.IncrementCycleCount(ctx, session.ID)
-	if err != nil {
-		h.logger.Error("increment cycle count", "error", err, "session_id", session.ID)
-		return nil // the reply already went out; don't fail the update over bookkeeping
-	}
-	if count < auditTurnCap {
-		return nil
-	}
-
 	if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusQuestionCycle); err != nil {
 		h.logger.Error("advance phase", "error", err, "session_id", session.ID)
+		return c.Send(genericErrorMessage)
 	}
-	return nil
+	session.Status = db.SessionStatusQuestionCycle
+	session.CurrentQuestionID = nil
+	return h.askNextQuestion(ctx, c, student, session)
 }
 
 // handleQuestionCycle runs phase 3. It is split into two steps that

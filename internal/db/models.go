@@ -19,6 +19,16 @@ const (
 	WeakZoneStatusConfirmed  = "confirmed"
 )
 
+// Qualification steps. The value is the answer the bot is currently waiting
+// for; QualificationStepDone means all four answers are stored.
+const (
+	QualificationStepGrade = iota
+	QualificationStepDirection
+	QualificationStepExperience
+	QualificationStepInterviewTarget
+	QualificationStepDone
+)
+
 // Session status values. The first five are the interview FSM phases,
 // walked in order by internal/handlers; the last two are terminal
 // states set by EndSession once a session stops being active.
@@ -49,11 +59,13 @@ type AccessCode struct {
 
 // Session is one mock-interview run for a student.
 //
-// CurrentGrade, Grade (target grade), StudentRequest and SelfAssessment
-// are the four QUALIFICATION fields, filled in as the model reports them
-// (see internal/handlers' marker parsing). Grade is also the one used by
-// PickQuestion for question difficulty throughout the rest of the
-// session. WeakTopics is a comma-separated list of question_bank.topic
+// Grade, Direction, Experience and InterviewTarget are the four fields used
+// by the current deterministic QUALIFICATION flow. QualificationStep records
+// which answer the bot expects next. The older CurrentGrade, StudentRequest
+// and SelfAssessment columns are retained for schema compatibility but are no
+// longer written by the current flow. Grade is used by PickQuestion for
+// question difficulty throughout the rest of the session.
+// WeakTopics is a comma-separated list of question_bank.topic
 // values the mini-audit (AUDIT phase) flags as likely weak, used as a
 // priority filter in QUESTION_CYCLE.
 // CycleCount is reset to 0 on every phase transition and counts turns
@@ -78,6 +90,10 @@ type Session struct {
 	SelfAssessment    string     `db:"self_assessment"`
 	WeakTopics        string     `db:"weak_topics"` // comma-separated question_bank.topic values
 	CurrentQuestionID *int64     `db:"current_question_id"`
+	Direction         string     `db:"direction"`
+	Experience        string     `db:"experience"`
+	InterviewTarget   string     `db:"interview_target"`
+	QualificationStep int        `db:"qualification_step"`
 }
 
 // WeakZone is a topic the interviewer suspects (or has confirmed) the

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
@@ -23,9 +24,25 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
 	if err := run(logger); err != nil {
-		logger.Error("bot exited with error", "error", err)
+		logger.Error("bot exited with error", "error", redactConfiguredSecrets(err.Error()))
 		os.Exit(1)
 	}
+}
+
+// redactConfiguredSecrets prevents SDK/network errors from printing tokens or
+// database credentials embedded in request URLs. Some Telegram errors include
+// the complete bot token in their URL.
+func redactConfiguredSecrets(message string) string {
+	for _, secret := range []string{
+		os.Getenv("TELEGRAM_BOT_TOKEN"),
+		os.Getenv("OPENAI_API_KEY"),
+		os.Getenv("DATABASE_URL"),
+	} {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[REDACTED]")
+		}
+	}
+	return message
 }
 
 func run(logger *slog.Logger) error {

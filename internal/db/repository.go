@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -34,6 +35,14 @@ var (
 	// ErrQuestionNotFound is returned when no question_bank row exists
 	// for a given ID.
 	ErrQuestionNotFound = errors.New("question not found")
+
+	// ErrNoActiveQuestionAttempt is returned when a session has no unfinished
+	// two-answer question cycle.
+	ErrNoActiveQuestionAttempt = errors.New("no active question attempt")
+
+	// ErrSummaryNotFound is returned when a session has not persisted its
+	// final report yet.
+	ErrSummaryNotFound = errors.New("session summary not found")
 )
 
 // Repository provides data access for the interview bot's PostgreSQL schema.
@@ -115,16 +124,16 @@ func (r *Repository) StartSession(ctx context.Context, studentID int64) (*Sessio
 		`INSERT INTO sessions (
 		     student_id, status, cycle_count,
 		     current_grade, grade, student_request, self_assessment, weak_topics, current_question_id,
-		     direction, experience, interview_target, qualification_step
+		     direction, experience, interview_target, qualification_step, next_topic
 		 )
-		 VALUES ($1, $2, 0, '', '', '', '', '', NULL, '', '', '', 0)
+		 VALUES ($1, $2, 0, '', '', '', '', '', NULL, '', '', '', 0, '')
 		 RETURNING id, student_id, started_at, ended_at, status, cycle_count,
 		           current_grade, grade, student_request, self_assessment, weak_topics, current_question_id,
-		           direction, experience, interview_target, qualification_step`,
+		           direction, experience, interview_target, qualification_step, next_topic`,
 		studentID, SessionStatusInstruction,
 	).Scan(&s.ID, &s.StudentID, &s.StartedAt, &s.EndedAt, &s.Status, &s.CycleCount,
 		&s.CurrentGrade, &s.Grade, &s.StudentRequest, &s.SelfAssessment, &s.WeakTopics, &s.CurrentQuestionID,
-		&s.Direction, &s.Experience, &s.InterviewTarget, &s.QualificationStep)
+		&s.Direction, &s.Experience, &s.InterviewTarget, &s.QualificationStep, &s.NextTopic)
 	if err != nil {
 		return nil, fmt.Errorf("start session: %w", err)
 	}
@@ -154,7 +163,7 @@ func (r *Repository) GetActiveSession(ctx context.Context, studentID int64) (*Se
 	err := r.pool.QueryRow(ctx,
 		`SELECT id, student_id, started_at, ended_at, status, cycle_count,
 		        current_grade, grade, student_request, self_assessment, weak_topics, current_question_id,
-		        direction, experience, interview_target, qualification_step
+		        direction, experience, interview_target, qualification_step, next_topic
 		 FROM sessions
 		 WHERE student_id = $1 AND ended_at IS NULL
 		 ORDER BY started_at DESC
@@ -162,7 +171,7 @@ func (r *Repository) GetActiveSession(ctx context.Context, studentID int64) (*Se
 		studentID,
 	).Scan(&s.ID, &s.StudentID, &s.StartedAt, &s.EndedAt, &s.Status, &s.CycleCount,
 		&s.CurrentGrade, &s.Grade, &s.StudentRequest, &s.SelfAssessment, &s.WeakTopics, &s.CurrentQuestionID,
-		&s.Direction, &s.Experience, &s.InterviewTarget, &s.QualificationStep)
+		&s.Direction, &s.Experience, &s.InterviewTarget, &s.QualificationStep, &s.NextTopic)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNoActiveSession
 	}
@@ -179,13 +188,13 @@ func (r *Repository) SetQualificationAnswer(ctx context.Context, sessionID int64
 	var query string
 	switch step {
 	case QualificationStepGrade:
-		query = `UPDATE sessions SET grade = $2, qualification_step = 1 WHERE id = $1 AND qualification_step = 0`
+		query = `UPDATE sessions SET grade = $2, qualification_step = 1 WHERE id = $1 AND status = 'QUALIFICATION' AND qualification_step = 0`
 	case QualificationStepDirection:
-		query = `UPDATE sessions SET direction = $2, qualification_step = 2 WHERE id = $1 AND qualification_step = 1`
+		query = `UPDATE sessions SET direction = $2, qualification_step = 2 WHERE id = $1 AND status = 'QUALIFICATION' AND qualification_step = 1`
 	case QualificationStepExperience:
-		query = `UPDATE sessions SET experience = $2, qualification_step = 3 WHERE id = $1 AND qualification_step = 2`
+		query = `UPDATE sessions SET experience = $2, qualification_step = 3 WHERE id = $1 AND status = 'QUALIFICATION' AND qualification_step = 2`
 	case QualificationStepInterviewTarget:
-		query = `UPDATE sessions SET interview_target = $2, qualification_step = 4 WHERE id = $1 AND qualification_step = 3`
+		query = `UPDATE sessions SET interview_target = $2, qualification_step = 4 WHERE id = $1 AND status = 'QUALIFICATION' AND qualification_step = 3`
 	default:
 		return fmt.Errorf("set qualification answer: invalid step %d", step)
 	}
@@ -205,87 +214,65 @@ func (r *Repository) SetQualificationAnswer(ctx context.Context, sessionID int64
 // question tracking in internal/handlers always start from a clean
 // slate right after a transition.
 func (r *Repository) AdvancePhase(ctx context.Context, sessionID int64, newStatus string) error {
+	expectedStatus := map[string]string{
+		SessionStatusQualification: SessionStatusInstruction,
+		SessionStatusAudit:         SessionStatusQualification,
+		SessionStatusQuestionCycle: SessionStatusAudit,
+		SessionStatusSummary:       SessionStatusQuestionCycle,
+	}[newStatus]
+	if expectedStatus == "" {
+		return fmt.Errorf("advance phase: invalid target status %q", newStatus)
+	}
 	tag, err := r.pool.Exec(ctx,
-		`UPDATE sessions SET status = $2, cycle_count = 0, current_question_id = NULL WHERE id = $1`,
-		sessionID, newStatus,
+		`UPDATE sessions
+		 SET status = $2, cycle_count = 0, current_question_id = NULL
+		 WHERE id = $1 AND status = $3 AND ended_at IS NULL`,
+		sessionID, newStatus, expectedStatus,
 	)
 	if err != nil {
 		return fmt.Errorf("advance phase: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("advance phase: session %d not found", sessionID)
+		return fmt.Errorf("advance phase: session %d is not in expected status %s", sessionID, expectedStatus)
 	}
 	return nil
 }
 
-// SetCurrentQuestionID sets sessionID's current_question_id, or clears
-// it when questionID is nil.
-func (r *Repository) SetCurrentQuestionID(ctx context.Context, sessionID int64, questionID *int64) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE sessions SET current_question_id = $2 WHERE id = $1`,
-		sessionID, questionID,
+// SaveAuditResults atomically stores the audit's topic list and creates or
+// refreshes each corresponding weak-zone hypothesis. The question cycle must
+// not start with only half of this state persisted.
+func (r *Repository) SaveAuditResults(ctx context.Context, sessionID, studentID int64, topics []string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("save audit results begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE sessions SET weak_topics = $2 WHERE id = $1 AND status = $3`,
+		sessionID, strings.Join(topics, ","), SessionStatusAudit,
 	)
 	if err != nil {
-		return fmt.Errorf("set current question id: %w", err)
+		return fmt.Errorf("save audit results update session: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("set current question id: session %d not found", sessionID)
+		return fmt.Errorf("save audit results: session %d is not in audit", sessionID)
 	}
-	return nil
-}
 
-// IncrementCycleCount increments sessionID's cycle_count by one and
-// returns the new value.
-func (r *Repository) IncrementCycleCount(ctx context.Context, sessionID int64) (int, error) {
-	var count int
-	err := r.pool.QueryRow(ctx,
-		`UPDATE sessions SET cycle_count = cycle_count + 1 WHERE id = $1 RETURNING cycle_count`,
-		sessionID,
-	).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("increment cycle count: %w", err)
+	for _, topic := range topics {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO weak_zones (student_id, zone_text, status)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (student_id, zone_text)
+			 DO UPDATE SET status = EXCLUDED.status, updated_at = now()`,
+			studentID, topic, WeakZoneStatusHypothesis,
+		); err != nil {
+			return fmt.Errorf("save audit weak zone %q: %w", topic, err)
+		}
 	}
-	return count, nil
-}
 
-// SetQualificationFields updates whichever of sessionID's four
-// QUALIFICATION fields are non-empty (current grade, target grade,
-// student request, self-assessment). An empty argument leaves its
-// column unchanged, since the model reveals each field on whichever
-// turn it becomes confident about it, not necessarily the same turn.
-func (r *Repository) SetQualificationFields(ctx context.Context, sessionID int64, currentGrade, targetGrade, studentRequest, selfAssessment string) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE sessions
-		 SET current_grade = CASE WHEN $2 = '' THEN current_grade ELSE $2 END,
-		     grade = CASE WHEN $3 = '' THEN grade ELSE $3 END,
-		     student_request = CASE WHEN $4 = '' THEN student_request ELSE $4 END,
-		     self_assessment = CASE WHEN $5 = '' THEN self_assessment ELSE $5 END
-		 WHERE id = $1`,
-		sessionID, currentGrade, targetGrade, studentRequest, selfAssessment,
-	)
-	if err != nil {
-		return fmt.Errorf("set qualification fields: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("set qualification fields: session %d not found", sessionID)
-	}
-	return nil
-}
-
-// SetWeakTopics sets sessionID's weak_topics to a comma-separated list
-// of question_bank.topic values, extracted from the mini-audit (AUDIT
-// phase) and used as a priority filter in QUESTION_CYCLE's PickQuestion
-// calls.
-func (r *Repository) SetWeakTopics(ctx context.Context, sessionID int64, topics string) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE sessions SET weak_topics = $2 WHERE id = $1`,
-		sessionID, topics,
-	)
-	if err != nil {
-		return fmt.Errorf("set weak topics: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("set weak topics: session %d not found", sessionID)
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("save audit results commit: %w", err)
 	}
 	return nil
 }
@@ -293,15 +280,18 @@ func (r *Repository) SetWeakTopics(ctx context.Context, sessionID int64, topics 
 // EndSession marks sessionID as finished with the given status
 // (e.g. "completed", "abandoned") and stamps ended_at.
 func (r *Repository) EndSession(ctx context.Context, sessionID int64, status string) error {
+	if status != SessionStatusCompleted && status != SessionStatusAbandoned {
+		return fmt.Errorf("end session: invalid terminal status %q", status)
+	}
 	tag, err := r.pool.Exec(ctx,
-		`UPDATE sessions SET status = $2, ended_at = now() WHERE id = $1`,
+		`UPDATE sessions SET status = $2, ended_at = now() WHERE id = $1 AND ended_at IS NULL`,
 		sessionID, status,
 	)
 	if err != nil {
 		return fmt.Errorf("end session: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("end session: session %d not found", sessionID)
+		return fmt.Errorf("end session: session %d is not active", sessionID)
 	}
 	return nil
 }
@@ -356,17 +346,16 @@ func (r *Repository) GetWeakZones(ctx context.Context, studentID int64) ([]WeakZ
 }
 
 // PickQuestion returns a random question_bank row for grade, optionally
-// narrowed down to topic. Grade matching is a substring check rather than
-// equality: bridge grades like "джун-мидл" contain "джун", so a "джун"
-// candidate is also offered questions tagged for the bridge grade (and
-// likewise "мидл" candidates get "джун-мидл" and "мидл-сеньор" ones).
+// narrowed down to topic. Grade compatibility is an explicit mapping rather
+// than a substring match, so adding a new grade name cannot silently alter
+// which questions existing candidates receive.
 func (r *Repository) PickQuestion(ctx context.Context, grade, topic string) (*QuestionBank, error) {
 	query := `
 		SELECT id, question_text, grade, topic, followup_1, followup_2,
 		       answer_junior, answer_middle, answer_senior, source
 		FROM question_bank
-		WHERE grade LIKE '%' || $1 || '%'`
-	args := []any{grade}
+		WHERE grade = ANY($1)`
+	args := []any{compatibleQuestionGrades(grade)}
 
 	if topic != "" {
 		query += ` AND topic = $2`
@@ -387,6 +376,57 @@ func (r *Repository) PickQuestion(ctx context.Context, grade, topic string) (*Qu
 	}
 
 	return q, nil
+}
+
+// PickQuestionForSession excludes every question already used by the session.
+// Topic remains optional and callers may retry without it when a narrow pool is
+// exhausted.
+func (r *Repository) PickQuestionForSession(ctx context.Context, sessionID int64, grade, topic string) (*QuestionBank, error) {
+	query := `
+		SELECT q.id, q.question_text, q.grade, q.topic, q.followup_1, q.followup_2,
+		       q.answer_junior, q.answer_middle, q.answer_senior, q.source
+		FROM question_bank q
+		WHERE q.grade = ANY($2)
+		  AND NOT EXISTS (
+		      SELECT 1 FROM question_attempts a
+		      WHERE a.session_id = $1 AND a.question_id = q.id
+		  )`
+	args := []any{sessionID, compatibleQuestionGrades(grade)}
+	if topic != "" {
+		query += ` AND q.topic = $3`
+		args = append(args, topic)
+	}
+	query += ` ORDER BY random() LIMIT 1`
+
+	q := &QuestionBank{}
+	err := r.pool.QueryRow(ctx, query, args...).Scan(
+		&q.ID, &q.QuestionText, &q.Grade, &q.Topic, &q.Followup1, &q.Followup2,
+		&q.AnswerJunior, &q.AnswerMiddle, &q.AnswerSenior, &q.Source,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNoMatchingQuestion
+	}
+	if err != nil {
+		return nil, fmt.Errorf("pick unused question for session: %w", err)
+	}
+	return q, nil
+}
+
+func compatibleQuestionGrades(grade string) []string {
+	switch strings.ToLower(strings.TrimSpace(grade)) {
+	case "джун":
+		return []string{"джун", "джун-мидл"}
+	case "джун-мидл":
+		return []string{"джун", "джун-мидл", "мидл"}
+	case "мидл":
+		return []string{"джун-мидл", "мидл", "мидл-сеньор"}
+	case "мидл-сеньор":
+		return []string{"мидл", "мидл-сеньор", "сеньор"}
+	case "сеньор":
+		return []string{"мидл-сеньор", "сеньор"}
+	default:
+		return []string{grade}
+	}
 }
 
 // GetQuestionByID returns the exact question_bank row for id, used to
@@ -411,6 +451,263 @@ func (r *Repository) GetQuestionByID(ctx context.Context, id int64) (*QuestionBa
 		return nil, fmt.Errorf("get question by id: %w", err)
 	}
 	return q, nil
+}
+
+// StartQuestionAttempt atomically points the session at questionID and creates
+// the durable two-answer cycle that will receive the student's next messages.
+func (r *Repository) StartQuestionAttempt(ctx context.Context, sessionID, questionID int64) (*QuestionAttempt, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("start question attempt begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE sessions
+		 SET current_question_id = $2, next_topic = ''
+		 WHERE id = $1 AND status = $3 AND ended_at IS NULL`,
+		sessionID, questionID, SessionStatusQuestionCycle,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("start question attempt update session: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, fmt.Errorf("start question attempt: session %d is not in question cycle", sessionID)
+	}
+
+	a := &QuestionAttempt{}
+	err = tx.QueryRow(ctx,
+		`INSERT INTO question_attempts (session_id, question_id)
+		 VALUES ($1, $2)
+		 RETURNING id, session_id, question_id, primary_answer, primary_feedback,
+		           followup_question, followup_answer, final_feedback, selected_vector,
+		           status, created_at, updated_at`,
+		sessionID, questionID,
+	).Scan(
+		&a.ID, &a.SessionID, &a.QuestionID, &a.PrimaryAnswer, &a.PrimaryFeedback,
+		&a.FollowupQuestion, &a.FollowupAnswer, &a.FinalFeedback, &a.SelectedVector,
+		&a.Status, &a.CreatedAt, &a.UpdatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("start question attempt insert: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("start question attempt commit: %w", err)
+	}
+	return a, nil
+}
+
+// GetActiveQuestionAttempt returns the unfinished attempt for sessionID.
+func (r *Repository) GetActiveQuestionAttempt(ctx context.Context, sessionID int64) (*QuestionAttempt, error) {
+	a := &QuestionAttempt{}
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, session_id, question_id, primary_answer, primary_feedback,
+		        followup_question, followup_answer, final_feedback, selected_vector,
+		        status, created_at, updated_at
+		 FROM question_attempts
+		 WHERE session_id = $1 AND status <> $2
+		 ORDER BY id DESC
+		 LIMIT 1`,
+		sessionID, QuestionAttemptCompleted,
+	).Scan(
+		&a.ID, &a.SessionID, &a.QuestionID, &a.PrimaryAnswer, &a.PrimaryFeedback,
+		&a.FollowupQuestion, &a.FollowupAnswer, &a.FinalFeedback, &a.SelectedVector,
+		&a.Status, &a.CreatedAt, &a.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNoActiveQuestionAttempt
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get active question attempt: %w", err)
+	}
+	return a, nil
+}
+
+// SavePrimaryFeedback stores the first answer and marks its outbound feedback
+// ready. The attempt starts waiting for the student's follow-up only after both
+// Telegram messages have actually been delivered.
+func (r *Repository) SavePrimaryFeedback(ctx context.Context, attemptID int64, answer, feedback, followupQuestion string) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE question_attempts
+		 SET primary_answer = $2, primary_feedback = $3, followup_question = $4,
+		     status = $5, updated_at = now()
+		 WHERE id = $1 AND status = $6`,
+		attemptID, answer, feedback, followupQuestion,
+		QuestionAttemptPrimaryFeedbackReady, QuestionAttemptWaitingPrimary,
+	)
+	if err != nil {
+		return fmt.Errorf("save primary feedback: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("save primary feedback: attempt %d is not waiting for a primary answer", attemptID)
+	}
+	return nil
+}
+
+// MarkPrimaryFeedbackDelivered moves a persisted outbound feedback/follow-up
+// pair to the state that consumes the student's next message.
+func (r *Repository) MarkPrimaryFeedbackDelivered(ctx context.Context, attemptID int64) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE question_attempts
+		 SET status = $2, updated_at = now()
+		 WHERE id = $1 AND status = $3`,
+		attemptID, QuestionAttemptWaitingFollowup, QuestionAttemptPrimaryFeedbackReady,
+	)
+	if err != nil {
+		return fmt.Errorf("mark primary feedback delivered: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("mark primary feedback delivered: attempt %d is not ready", attemptID)
+	}
+	return nil
+}
+
+// FinalizeQuestionAttempt atomically stores the second answer and feedback,
+// updates the evidence-backed weak-zone status, and increments the count of
+// fully evaluated cycles.
+func (r *Repository) FinalizeQuestionAttempt(ctx context.Context, sessionID, studentID, attemptID int64, answer, feedback, zoneTopic, zoneStatus string) (int, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("finalize question attempt begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE question_attempts
+		 SET followup_answer = $2, final_feedback = $3, status = $4, updated_at = now()
+		 WHERE id = $1 AND session_id = $5 AND status = $6`,
+		attemptID, answer, feedback, QuestionAttemptFinalFeedbackReady,
+		sessionID, QuestionAttemptWaitingFollowup,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("finalize question attempt update attempt: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return 0, fmt.Errorf("finalize question attempt: attempt %d is not waiting for a follow-up answer", attemptID)
+	}
+
+	if zoneTopic != "" {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO weak_zones (student_id, zone_text, status)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (student_id, zone_text)
+			 DO UPDATE SET status = EXCLUDED.status, updated_at = now()`,
+			studentID, zoneTopic, zoneStatus,
+		); err != nil {
+			return 0, fmt.Errorf("finalize question attempt weak zone: %w", err)
+		}
+	}
+
+	var count int
+	if err := tx.QueryRow(ctx,
+		`UPDATE sessions
+		 SET cycle_count = cycle_count + 1
+		 WHERE id = $1 AND status = $2
+		 RETURNING cycle_count`,
+		sessionID, SessionStatusQuestionCycle,
+	).Scan(&count); err != nil {
+		return 0, fmt.Errorf("finalize question attempt increment cycle: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("finalize question attempt commit: %w", err)
+	}
+	return count, nil
+}
+
+// MarkFinalFeedbackDelivered advances the attempt only after the full feedback
+// reached Telegram. A failed send leaves it ready for deterministic resend.
+func (r *Repository) MarkFinalFeedbackDelivered(ctx context.Context, attemptID int64) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE question_attempts
+		 SET status = $2, updated_at = now()
+		 WHERE id = $1 AND status = $3`,
+		attemptID, QuestionAttemptWaitingVector, QuestionAttemptFinalFeedbackReady,
+	)
+	if err != nil {
+		return fmt.Errorf("mark final feedback delivered: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("mark final feedback delivered: attempt %d is not ready", attemptID)
+	}
+	return nil
+}
+
+// CompleteQuestionAttempt records the vector choice and prepares the session
+// for its next question. nextTopic is a concrete bank topic, "*" for random,
+// or empty to return to automatic priority selection.
+func (r *Repository) CompleteQuestionAttempt(ctx context.Context, sessionID, attemptID int64, selectedVector, nextTopic string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("complete question attempt begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE question_attempts
+		 SET selected_vector = $2, status = $3, updated_at = now()
+		 WHERE id = $1 AND status = $4`,
+		attemptID, selectedVector, QuestionAttemptCompleted, QuestionAttemptWaitingVector,
+	)
+	if err != nil {
+		return fmt.Errorf("complete question attempt update attempt: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("complete question attempt: attempt %d is not waiting for a vector", attemptID)
+	}
+
+	tag, err = tx.Exec(ctx,
+		`UPDATE sessions
+		 SET current_question_id = NULL, next_topic = $2
+		 WHERE id = $1 AND status = $3 AND ended_at IS NULL`,
+		sessionID, nextTopic, SessionStatusQuestionCycle,
+	)
+	if err != nil {
+		return fmt.Errorf("complete question attempt update session: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("complete question attempt: session %d is not in question cycle", sessionID)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("complete question attempt commit: %w", err)
+	}
+	return nil
+}
+
+// GetSessionAttemptReports returns completed cycles in chronological order for
+// the final report prompt.
+func (r *Repository) GetSessionAttemptReports(ctx context.Context, sessionID int64) ([]QuestionAttemptReport, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT q.question_text, q.topic, a.primary_answer, a.followup_question,
+		        a.followup_answer, a.final_feedback
+		 FROM question_attempts a
+		 JOIN question_bank q ON q.id = a.question_id
+		 WHERE a.session_id = $1 AND a.status = $2
+		 ORDER BY a.id`,
+		sessionID, QuestionAttemptCompleted,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get session attempt reports: %w", err)
+	}
+	defer rows.Close()
+
+	var reports []QuestionAttemptReport
+	for rows.Next() {
+		var report QuestionAttemptReport
+		if err := rows.Scan(
+			&report.QuestionText, &report.Topic, &report.PrimaryAnswer,
+			&report.FollowupQuestion, &report.FollowupAnswer, &report.FinalFeedback,
+		); err != nil {
+			return nil, fmt.Errorf("scan session attempt report: %w", err)
+		}
+		reports = append(reports, report)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate session attempt reports: %w", err)
+	}
+	return reports, nil
 }
 
 // GetStudentReports returns an activity summary for every registered
@@ -491,11 +788,33 @@ func (r *Repository) SaveSummary(ctx context.Context, sessionID int64, summaryTe
 	err := r.pool.QueryRow(ctx,
 		`INSERT INTO session_summaries (session_id, summary_text)
 		 VALUES ($1, $2)
+		 ON CONFLICT (session_id)
+		 DO UPDATE SET summary_text = EXCLUDED.summary_text, created_at = now()
 		 RETURNING id, session_id, summary_text, created_at`,
 		sessionID, summaryText,
 	).Scan(&s.ID, &s.SessionID, &s.SummaryText, &s.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("save summary: %w", err)
+	}
+	return s, nil
+}
+
+// GetSummaryBySessionID returns a previously generated final report. Summary
+// recovery uses it after a Telegram send failure instead of paying for and
+// potentially changing a second LLM response.
+func (r *Repository) GetSummaryBySessionID(ctx context.Context, sessionID int64) (*SessionSummary, error) {
+	s := &SessionSummary{}
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, session_id, summary_text, created_at
+		 FROM session_summaries
+		 WHERE session_id = $1`,
+		sessionID,
+	).Scan(&s.ID, &s.SessionID, &s.SummaryText, &s.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrSummaryNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get session summary: %w", err)
 	}
 	return s, nil
 }

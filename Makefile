@@ -1,6 +1,6 @@
 SHELL := /bin/zsh
 
-.PHONY: run config-check db-start db-status test vet build check code
+.PHONY: run config-check db-start db-status migrate test vet build check code questions docker-db-up docker-db-down docker-db-reset
 
 run: config-check db-start
 	@echo "Starting bot. Press Ctrl+C to stop it."
@@ -33,6 +33,9 @@ db-start:
 db-status:
 	@pg_isready
 
+migrate: config-check db-start
+	go run ./cmd/migrate
+
 test:
 	go test ./...
 
@@ -46,3 +49,16 @@ check: test vet build
 
 code: config-check db-start
 	go run ./cmd/generate-codes -n 1
+
+questions: config-check db-start
+	go run ./cmd/import-questions -file question_bank.csv
+
+docker-db-up:
+	docker compose up -d --wait postgres
+
+docker-db-down:
+	docker compose down
+
+docker-db-reset:
+	docker compose down -v
+	docker compose up -d --wait postgres

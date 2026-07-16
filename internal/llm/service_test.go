@@ -216,56 +216,6 @@ func TestBuildUserContext(t *testing.T) {
 	}
 }
 
-func TestBuildQualificationContext_PartiallyKnown(t *testing.T) {
-	known := QualificationKnown{
-		CurrentGrade: "джун",
-		TargetGrade:  "мидл",
-		// StudentRequest and SelfAssessment intentionally left unknown.
-	}
-
-	got := BuildQualificationContext(known, nil, "хочу подготовиться к собеседованию в Т-Банк")
-
-	for _, want := range []string{
-		"Инструкция уже была показана один раз в Фазе 0, не повторяй ее.",
-		"Текущий грейд: джун",
-		"Целевой грейд: мидл",
-		"Спроси только про недостающее",
-		"хочу подготовиться к собеседованию в Т-Банк",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("expected context to contain %q, got:\n%s", want, got)
-		}
-	}
-
-	// The two known fields must be listed as known, not as missing.
-	knownSection := got[:strings.Index(got, "Еще не известно:")]
-	missingSection := got[strings.Index(got, "Еще не известно:"):]
-	if strings.Contains(missingSection, "Текущий грейд") || strings.Contains(missingSection, "Целевой грейд") {
-		t.Errorf("known fields leaked into the missing section:\n%s", missingSection)
-	}
-	if !strings.Contains(missingSection, "Запрос") || !strings.Contains(missingSection, "Самооценка") {
-		t.Errorf("expected Запрос and Самооценка to be listed as missing:\n%s", missingSection)
-	}
-	if strings.Contains(knownSection, "Запрос:") || strings.Contains(knownSection, "Самооценка") {
-		t.Errorf("unknown fields leaked into the known section:\n%s", knownSection)
-	}
-}
-
-func TestBuildQualificationContext_AllKnown(t *testing.T) {
-	known := QualificationKnown{
-		CurrentGrade:   "джун",
-		TargetGrade:    "мидл",
-		StudentRequest: "хочет подготовиться к смене грейда",
-		SelfAssessment: "хорошо знает БД, слабо в архитектуре",
-	}
-
-	got := BuildQualificationContext(known, nil, "да, все верно")
-
-	if !strings.Contains(got, "(все четыре пункта уже известны)") {
-		t.Errorf("expected the missing section to say all four are known, got:\n%s", got)
-	}
-}
-
 func TestBuildAuditContext_IncludesFullQualificationProfileAndExplicitPhase(t *testing.T) {
 	profile := QualificationProfile{
 		Grade:           "мидл",
@@ -331,6 +281,52 @@ func TestEvaluate_SendsQuestionAndReferenceAnswersAsContext(t *testing.T) {
 	} {
 		if !strings.Contains(gotUserContent, want) {
 			t.Errorf("expected the request's user message to contain %q, got:\n%s", want, gotUserContent)
+		}
+	}
+}
+
+func TestBuildFollowupEvaluationContext_IncludesBothAnswersAndPinsPhase(t *testing.T) {
+	question := &db.QuestionBank{
+		ID: 8, QuestionText: "Как описать API?", Topic: "интеграции",
+		AnswerJunior: "jun", AnswerMiddle: "mid", AnswerSenior: "sen",
+	}
+	got := BuildFollowupEvaluationContext(
+		StudentProfile{Grade: "мидл"},
+		[]db.WeakZone{{ZoneText: "интеграции", Status: db.WeakZoneStatusHypothesis}},
+		"первый ответ", "почему выбрал REST?", "ответ на уточнение", question,
+	)
+
+	for _, want := range []string{
+		"ФАЗА 3", "шаги 5 и 6", "первый ответ", "почему выбрал REST?",
+		"ответ на уточнение", "ПОЛНАЯ ОБРАТНАЯ СВЯЗЬ", "WEAK_ZONE_STATUS",
+		"Не спрашивай грейд",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("follow-up context does not contain %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestBuildSummaryContext_UsesPersistedAttempts(t *testing.T) {
+	got := BuildSummaryContext(
+		QualificationProfile{
+			Grade: "джун", Direction: "финтех", Experience: "мало Kafka",
+			InterviewTarget: "собеседование завтра",
+		},
+		[]db.WeakZone{{ZoneText: "бд", Status: db.WeakZoneStatusConfirmed}},
+		[]db.QuestionAttemptReport{{
+			QuestionText: "Что такое индекс?", Topic: "бд",
+			PrimaryAnswer: "первый", FollowupQuestion: "когда вредит?",
+			FollowupAnswer: "второй", FinalFeedback: "нужно больше конкретики",
+		}},
+	)
+
+	for _, want := range []string{
+		"ФАЗА 4", "Что такое индекс?", "первый", "когда вредит?", "второй",
+		"нужно больше конкретики", "бд: confirmed", "финтех", "мало Kafka", "собеседование завтра",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("summary context does not contain %q:\n%s", want, got)
 		}
 	}
 }

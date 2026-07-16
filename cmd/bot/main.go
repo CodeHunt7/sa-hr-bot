@@ -7,7 +7,9 @@ import (
 	"database/sql"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
@@ -19,6 +21,8 @@ import (
 	"sa-hr-bot/internal/llm"
 	"sa-hr-bot/internal/migrations"
 )
+
+const shutdownDrainTimeout = 95 * time.Second
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -95,7 +99,21 @@ func run(logger *slog.Logger) error {
 	h.Register(bot)
 
 	logger.Info("bot starting")
+	shutdownSignal, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	go func() {
+		<-shutdownSignal.Done()
+		logger.Info("shutdown signal received, stopping polling")
+		bot.Stop()
+	}()
 	bot.Start()
+
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+	defer cancelDrain()
+	if err := h.Shutdown(drainCtx); err != nil {
+		logger.Warn("timed out waiting for handlers", "error", err)
+	}
+	logger.Info("bot stopped")
 
 	return nil
 }

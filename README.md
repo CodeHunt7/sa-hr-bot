@@ -46,6 +46,7 @@ Telegram-бот для тренировочных технических соб�
 cmd/bot/               точка входа бота (main.go)
 cmd/import-questions/  утилита импорта question_bank.csv в БД
 cmd/generate-codes/    утилита генерации кодов доступа
+cmd/migrate/           применение Goose-миграций без запуска бота
 internal/config/       загрузка конфигурации из окружения/.env
 internal/handlers/     конечный автомат сессии + обработчики Telegram
 internal/llm/          клиент и сервис OpenAI API
@@ -83,12 +84,13 @@ docker run --name sa-hr-bot-db -e POSTGRES_PASSWORD=postgres \
 ```bash
 go mod download
 go build ./...
-go run ./cmd/bot
+make migrate
+make run
 ```
 
 Миграции применяются автоматически при старте приложения (см.
-`internal/migrations`), но их можно накатывать/откатывать вручную —
-например, чтобы проверить миграцию перед деплоем или сделать `down`.
+`internal/migrations`). Отдельно от бота все миграции вверх запускаются командой
+`make migrate`; для точечного `down` остаётся Goose CLI, описанный ниже.
 
 Прежде чем писать боту, сгенерируйте код доступа: `go run ./cmd/generate-codes -n 1`
 выведет код в консоль и вставит его в `access_codes` как неиспользованный.

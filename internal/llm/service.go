@@ -29,6 +29,10 @@ type QuestionPicker interface {
 	PickQuestion(ctx context.Context, grade, topic string) (*db.QuestionBank, error)
 }
 
+type sessionQuestionPicker interface {
+	PickQuestionForSession(ctx context.Context, sessionID int64, grade, topic string) (*db.QuestionBank, error)
+}
+
 // StudentProfile is the compact learner profile folded into every user
 // message: the target grade, never the full qualification transcript.
 type StudentProfile struct {
@@ -123,6 +127,15 @@ func (s *Service) PickQuestion(ctx context.Context, grade, topic string) (*db.Qu
 	return s.questions.PickQuestion(ctx, grade, topic)
 }
 
+// PickQuestionForSession uses session-aware exclusion when the repository
+// supports it and falls back to the legacy picker in isolated tests.
+func (s *Service) PickQuestionForSession(ctx context.Context, sessionID int64, grade, topic string) (*db.QuestionBank, error) {
+	if picker, ok := s.questions.(sessionQuestionPicker); ok {
+		return picker.PickQuestionForSession(ctx, sessionID, grade, topic)
+	}
+	return s.questions.PickQuestion(ctx, grade, topic)
+}
+
 // BuildUserContext assembles the compact, per-call user message: the
 // candidate's profile, the current weak-zone map, at most the last two
 // dialog turns, and, when the caller is mid question-cycle, the picked
@@ -200,89 +213,6 @@ func BuildAuditContext(profile QualificationProfile, weakZones []db.WeakZone) st
 	return b.String()
 }
 
-// QualificationKnown is what has already been extracted for the current
-// session's four QUALIFICATION fields (see prompts/system_prompt.md's
-// "Технические метки" section). An empty field means it is still
-// unknown.
-type QualificationKnown struct {
-	CurrentGrade   string
-	TargetGrade    string
-	StudentRequest string
-	SelfAssessment string
-}
-
-// qualificationFieldLabels pairs each QualificationKnown field with the
-// label used to render it, in the fixed order the "known"/"missing"
-// lists are always presented in.
-var qualificationFieldLabels = []struct {
-	label string
-	get   func(QualificationKnown) string
-}{
-	{"Текущий грейд", func(k QualificationKnown) string { return k.CurrentGrade }},
-	{"Целевой грейд", func(k QualificationKnown) string { return k.TargetGrade }},
-	{"Запрос", func(k QualificationKnown) string { return k.StudentRequest }},
-	{"Самооценка сильных/слабых зон", func(k QualificationKnown) string { return k.SelfAssessment }},
-}
-
-// BuildQualificationContext assembles the compact per-call context for
-// phase 1 (QUALIFICATION). Unlike BuildUserContext, it also spells out
-// exactly which of the four qualification fields are already known
-// (with their values) and which are still missing, and instructs the
-// model not to re-ask what it already has or repeat the phase 0
-// instruction.
-//
-// This is necessary, not cosmetic: the compact per-call context (see
-// BuildUserContext's doc comment) never carries the full conversation,
-// so a model with no memory of earlier turns has no other way to know
-// it already asked about, say, the current grade two turns ago. Without
-// this explicit list the model tends to re-ask questions it already got
-// answers to.
-func BuildQualificationContext(known QualificationKnown, weakZones []db.WeakZone, studentAnswer string) string {
-	var b strings.Builder
-
-	b.WriteString("Инструкция уже была показана один раз в Фазе 0, не повторяй ее.\n\n")
-
-	b.WriteString("Уже известно:\n")
-	anyKnown := false
-	for _, f := range qualificationFieldLabels {
-		if v := f.get(known); v != "" {
-			fmt.Fprintf(&b, "- %s: %s\n", f.label, v)
-			anyKnown = true
-		}
-	}
-	if !anyKnown {
-		b.WriteString("(пока ничего не известно)\n")
-	}
-
-	b.WriteString("\nЕще не известно:\n")
-	anyMissing := false
-	for _, f := range qualificationFieldLabels {
-		if f.get(known) == "" {
-			fmt.Fprintf(&b, "- %s\n", f.label)
-			anyMissing = true
-		}
-	}
-	if !anyMissing {
-		b.WriteString("(все четыре пункта уже известны)\n")
-	}
-
-	b.WriteString("\nСпроси только про недостающее, по одному вопросу за раз.\n")
-
-	b.WriteString("\nКарта слабых зон:\n")
-	if len(weakZones) == 0 {
-		b.WriteString("(пока пусто)\n")
-	} else {
-		for _, wz := range weakZones {
-			fmt.Fprintf(&b, "- %s: %s\n", wz.ZoneText, wz.Status)
-		}
-	}
-
-	b.WriteString("\nПоследний ответ кандидата:\n")
-	fmt.Fprintf(&b, "%s\n", studentAnswer)
-
-	return b.String()
-}
-
 // BuildEvaluationContext pins the model to phase 3. Without this explicit
 // instruction, a short or nonsensical candidate answer can make the model
 // incorrectly restart phase 0 or qualification from the large system prompt.
@@ -291,7 +221,7 @@ func BuildEvaluationContext(profile StudentProfile, weakZones []db.WeakZone, stu
 	b.WriteString("Текущая задача: ФАЗА 3, оцени ответ кандидата на уже заданный технический вопрос.\n")
 	b.WriteString("Не повторяй инструкцию. Не начинай квалификацию. Не спрашивай грейд, направление, опыт или дату собеседования.\n")
 	b.WriteString("Даже если ответ бессмысленный, грубый или не относится к вопросу, оставайся в Фазе 3. Прямо скажи, что ответ не раскрывает тему, и кратко объясни, чего не хватило.\n")
-	b.WriteString("Для текущей минимальной версии верни только одну рамку `▸ ОБРАТНАЯ СВЯЗЬ`. Не задавай следующий вопрос и не начинай новую фазу: следующий вопрос отправит код.\n\n")
+	b.WriteString("Верни только одну рамку `▸ ОБРАТНАЯ СВЯЗЬ`. Не задавай следующий вопрос и не начинай новую фазу: уточнение из банка вопросов отправит код.\n\n")
 	b.WriteString(BuildUserContext(profile, weakZones, []Turn{{Role: "user", Content: studentAnswer}}, question))
 	return b.String()
 }
@@ -300,6 +230,68 @@ func BuildEvaluationContext(profile StudentProfile, weakZones []db.WeakZone, stu
 // explicitly keeping the model in phase 3.
 func (s *Service) Evaluate(ctx context.Context, profile StudentProfile, weakZones []db.WeakZone, studentAnswer string, question *db.QuestionBank) (*Reply, error) {
 	return s.Reply(ctx, BuildEvaluationContext(profile, weakZones, studentAnswer, question))
+}
+
+// BuildFollowupEvaluationContext supplies both answers from one question cycle
+// and pins the model to the final feedback steps of phase 3.
+func BuildFollowupEvaluationContext(profile StudentProfile, weakZones []db.WeakZone, primaryAnswer, followupQuestion, followupAnswer string, question *db.QuestionBank) string {
+	var b strings.Builder
+	b.WriteString("Текущая задача: ФАЗА 3, шаги 5 и 6. Разбери ответ на уточнение и всю связку из двух ответов.\n")
+	b.WriteString("Не повторяй инструкцию и квалификацию. Не спрашивай грейд. Не задавай новый вопрос.\n")
+	b.WriteString("Сначала дай рамку `▸ ОБРАТНАЯ СВЯЗЬ` и скажи, закрыт ли пробел после уточнения.\n")
+	b.WriteString("Затем дай рамку `▸ ПОЛНАЯ ОБРАТНАЯ СВЯЗЬ` по формуле Контекст, Выбор, Аргумент, Результат.\n")
+	b.WriteString("Затем покажи полную рамку `▸ КАРТА СЛАБЫХ МЕСТ (обновлено)` с текущими зонами и темой этого вопроса.\n")
+	b.WriteString("В самом конце добавь служебную строку `WEAK_ZONE_STATUS: confirmed`, если пробел остался, или `WEAK_ZONE_STATUS: closed`, если кандидат исправился. Других служебных строк не добавляй.\n")
+	b.WriteString("Даже если один из ответов грубый или бессмысленный, оставайся в этой задаче и оцени отсутствие содержательного ответа прямо.\n\n")
+	b.WriteString(BuildUserContext(profile, weakZones, nil, question))
+	fmt.Fprintf(&b, "\nОсновной ответ кандидата:\n%s\n", primaryAnswer)
+	fmt.Fprintf(&b, "\nУточняющий вопрос:\n%s\n", followupQuestion)
+	fmt.Fprintf(&b, "\nОтвет кандидата на уточнение:\n%s\n", followupAnswer)
+	return b.String()
+}
+
+// EvaluateFollowup produces the full-cycle feedback after the second answer.
+func (s *Service) EvaluateFollowup(ctx context.Context, profile StudentProfile, weakZones []db.WeakZone, primaryAnswer, followupQuestion, followupAnswer string, question *db.QuestionBank) (*Reply, error) {
+	return s.Reply(ctx, BuildFollowupEvaluationContext(
+		profile, weakZones, primaryAnswer, followupQuestion, followupAnswer, question,
+	))
+}
+
+// BuildSummaryContext creates an explicit phase-4 request from facts persisted
+// across the completed question attempts.
+func BuildSummaryContext(profile QualificationProfile, weakZones []db.WeakZone, attempts []db.QuestionAttemptReport) string {
+	var b strings.Builder
+	b.WriteString("Текущая задача: ФАЗА 4, итоговый отчет по завершенной сессии.\n")
+	b.WriteString("Не повторяй инструкцию, квалификацию или вопросы. Используй только факты ниже.\n")
+	b.WriteString("Дай краткую итоговую карту слабых зон и 2-3 конкретные рекомендации перед собеседованием.\n\n")
+	fmt.Fprintf(&b, "Грейд кандидата: %s\n", profile.Grade)
+	fmt.Fprintf(&b, "Направление и индустрия: %s\n", profile.Direction)
+	fmt.Fprintf(&b, "Исходный опыт и пробелы: %s\n", profile.Experience)
+	fmt.Fprintf(&b, "Вакансия или дата собеседования: %s\n", profile.InterviewTarget)
+
+	b.WriteString("\nКарта слабых зон:\n")
+	if len(weakZones) == 0 {
+		b.WriteString("(нет сохраненных зон)\n")
+	} else {
+		for _, zone := range weakZones {
+			fmt.Fprintf(&b, "- %s: %s\n", zone.ZoneText, zone.Status)
+		}
+	}
+
+	b.WriteString("\nЗавершенные циклы:\n")
+	if len(attempts) == 0 {
+		b.WriteString("(нет сохраненных циклов)\n")
+	} else {
+		for i, attempt := range attempts {
+			fmt.Fprintf(&b, "\nЦикл %d, тема %s\n", i+1, attempt.Topic)
+			fmt.Fprintf(&b, "Основной вопрос: %s\n", attempt.QuestionText)
+			fmt.Fprintf(&b, "Основной ответ: %s\n", attempt.PrimaryAnswer)
+			fmt.Fprintf(&b, "Уточнение: %s\n", attempt.FollowupQuestion)
+			fmt.Fprintf(&b, "Ответ на уточнение: %s\n", attempt.FollowupAnswer)
+			fmt.Fprintf(&b, "Зафиксированная обратная связь: %s\n", attempt.FinalFeedback)
+		}
+	}
+	return b.String()
 }
 
 // Reply sends the stable system prompt together with userMessage to the

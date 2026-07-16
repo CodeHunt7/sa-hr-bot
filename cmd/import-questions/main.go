@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
@@ -28,6 +29,16 @@ var requiredColumns = []string{
 	"answer_middle",
 	"answer_senior",
 	"source",
+}
+
+var allowedGrades = map[string]bool{
+	"джун": true, "джун-мидл": true, "мидл": true,
+	"мидл-сеньор": true, "сеньор": true,
+}
+
+var allowedTopics = map[string]bool{
+	"интеграции": true, "архитектура": true, "бд": true,
+	"требования": true, "безопасность": true, "подача": true,
 }
 
 func main() {
@@ -65,6 +76,10 @@ func run() error {
 
 	colIndex := make(map[string]int, len(header))
 	for i, name := range header {
+		name = strings.TrimPrefix(strings.TrimSpace(name), "\ufeff")
+		if _, exists := colIndex[name]; exists {
+			return fmt.Errorf("csv header contains duplicate column %q", name)
+		}
 		colIndex[name] = i
 	}
 	for _, col := range requiredColumns {
@@ -95,11 +110,24 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("read csv row %d: %w", imported+2, err)
 		}
+		row = normalizeQuestionRow(row, colIndex)
+		if err := validateQuestionRow(row, colIndex); err != nil {
+			return fmt.Errorf("validate csv row %d: %w", imported+2, err)
+		}
 
 		_, err = tx.Exec(ctx,
 			`INSERT INTO question_bank
 			 (question_text, grade, topic, followup_1, followup_2, answer_junior, answer_middle, answer_senior, source)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			 ON CONFLICT (question_text) DO UPDATE SET
+			     grade = EXCLUDED.grade,
+			     topic = EXCLUDED.topic,
+			     followup_1 = EXCLUDED.followup_1,
+			     followup_2 = EXCLUDED.followup_2,
+			     answer_junior = EXCLUDED.answer_junior,
+			     answer_middle = EXCLUDED.answer_middle,
+			     answer_senior = EXCLUDED.answer_senior,
+			     source = EXCLUDED.source`,
 			row[colIndex["question_text"]],
 			row[colIndex["grade"]],
 			row[colIndex["topic"]],
@@ -121,5 +149,37 @@ func run() error {
 	}
 
 	fmt.Printf("Загружено вопросов: %d\n", imported)
+	return nil
+}
+
+func normalizeQuestionRow(row []string, columns map[string]int) []string {
+	normalized := append([]string(nil), row...)
+	for _, column := range requiredColumns {
+		normalized[columns[column]] = strings.TrimSpace(normalized[columns[column]])
+	}
+	normalized[columns["grade"]] = strings.ToLower(normalized[columns["grade"]])
+	normalized[columns["topic"]] = strings.ToLower(normalized[columns["topic"]])
+	return normalized
+}
+
+func validateQuestionRow(row []string, columns map[string]int) error {
+	requiredText := []string{
+		"question_text", "followup_1", "followup_2",
+		"answer_junior", "answer_middle", "answer_senior",
+	}
+	for _, column := range requiredText {
+		if strings.TrimSpace(row[columns[column]]) == "" {
+			return fmt.Errorf("column %q must not be empty", column)
+		}
+	}
+
+	grade := row[columns["grade"]]
+	if !allowedGrades[grade] {
+		return fmt.Errorf("unsupported grade %q", row[columns["grade"]])
+	}
+	topic := row[columns["topic"]]
+	if !allowedTopics[topic] {
+		return fmt.Errorf("unsupported topic %q", row[columns["topic"]])
+	}
 	return nil
 }

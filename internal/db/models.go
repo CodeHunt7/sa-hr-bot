@@ -17,6 +17,16 @@ import "time"
 const (
 	WeakZoneStatusHypothesis = "hypothesis"
 	WeakZoneStatusConfirmed  = "confirmed"
+	WeakZoneStatusClosed     = "closed"
+)
+
+const (
+	QuestionAttemptWaitingPrimary       = "WAITING_PRIMARY"
+	QuestionAttemptPrimaryFeedbackReady = "PRIMARY_FEEDBACK_READY"
+	QuestionAttemptWaitingFollowup      = "WAITING_FOLLOWUP"
+	QuestionAttemptFinalFeedbackReady   = "FINAL_FEEDBACK_READY"
+	QuestionAttemptWaitingVector        = "WAITING_VECTOR"
+	QuestionAttemptCompleted            = "COMPLETED"
 )
 
 // Qualification steps. The value is the answer the bot is currently waiting
@@ -94,6 +104,34 @@ type Session struct {
 	Experience        string     `db:"experience"`
 	InterviewTarget   string     `db:"interview_target"`
 	QualificationStep int        `db:"qualification_step"`
+	NextTopic         string     `db:"next_topic"`
+}
+
+// QuestionAttempt persists one complete two-answer interview cycle.
+type QuestionAttempt struct {
+	ID               int64     `db:"id"`
+	SessionID        int64     `db:"session_id"`
+	QuestionID       int64     `db:"question_id"`
+	PrimaryAnswer    string    `db:"primary_answer"`
+	PrimaryFeedback  string    `db:"primary_feedback"`
+	FollowupQuestion string    `db:"followup_question"`
+	FollowupAnswer   string    `db:"followup_answer"`
+	FinalFeedback    string    `db:"final_feedback"`
+	SelectedVector   string    `db:"selected_vector"`
+	Status           string    `db:"status"`
+	CreatedAt        time.Time `db:"created_at"`
+	UpdatedAt        time.Time `db:"updated_at"`
+}
+
+// QuestionAttemptReport joins an attempt with the bank question for the final
+// report context.
+type QuestionAttemptReport struct {
+	QuestionText     string
+	Topic            string
+	PrimaryAnswer    string
+	FollowupQuestion string
+	FollowupAnswer   string
+	FinalFeedback    string
 }
 
 // WeakZone is a topic the interviewer suspects (or has confirmed) the
@@ -103,7 +141,7 @@ type WeakZone struct {
 	ID        int64     `db:"id"`
 	StudentID int64     `db:"student_id"`
 	ZoneText  string    `db:"zone_text"`
-	Status    string    `db:"status"` // "hypothesis" | "confirmed"
+	Status    string    `db:"status"` // "hypothesis" | "confirmed" | "closed"
 	UpdatedAt time.Time `db:"updated_at"`
 }
 

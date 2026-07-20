@@ -37,7 +37,7 @@ var (
 	ErrQuestionNotFound = errors.New("question not found")
 
 	// ErrNoActiveQuestionAttempt is returned when a session has no unfinished
-	// two-answer question cycle.
+	// three-answer question block.
 	ErrNoActiveQuestionAttempt = errors.New("no active question attempt")
 
 	// ErrSummaryNotFound is returned when a session has not persisted its
@@ -124,16 +124,19 @@ func (r *Repository) StartSession(ctx context.Context, studentID int64) (*Sessio
 		`INSERT INTO sessions (
 		     student_id, status, cycle_count,
 		     current_grade, grade, student_request, self_assessment, weak_topics, current_question_id,
-		     direction, experience, interview_target, qualification_step, next_topic
+		     direction, experience, interview_target, qualification_step, next_topic,
+		     strong_zones, weak_zones_input
 		 )
-		 VALUES ($1, $2, 0, '', '', '', '', '', NULL, '', '', '', 0, '')
+		 VALUES ($1, $2, 0, '', '', '', '', '', NULL, '', '', '', 0, '', '', '')
 		 RETURNING id, student_id, started_at, ended_at, status, cycle_count,
 		           current_grade, grade, student_request, self_assessment, weak_topics, current_question_id,
-		           direction, experience, interview_target, qualification_step, next_topic`,
+		           direction, experience, interview_target, qualification_step, next_topic,
+		           strong_zones, weak_zones_input`,
 		studentID, SessionStatusInstruction,
 	).Scan(&s.ID, &s.StudentID, &s.StartedAt, &s.EndedAt, &s.Status, &s.CycleCount,
 		&s.CurrentGrade, &s.Grade, &s.StudentRequest, &s.SelfAssessment, &s.WeakTopics, &s.CurrentQuestionID,
-		&s.Direction, &s.Experience, &s.InterviewTarget, &s.QualificationStep, &s.NextTopic)
+		&s.Direction, &s.Experience, &s.InterviewTarget, &s.QualificationStep, &s.NextTopic,
+		&s.StrongZones, &s.WeakZonesInput)
 	if err != nil {
 		return nil, fmt.Errorf("start session: %w", err)
 	}
@@ -163,7 +166,8 @@ func (r *Repository) GetActiveSession(ctx context.Context, studentID int64) (*Se
 	err := r.pool.QueryRow(ctx,
 		`SELECT id, student_id, started_at, ended_at, status, cycle_count,
 		        current_grade, grade, student_request, self_assessment, weak_topics, current_question_id,
-		        direction, experience, interview_target, qualification_step, next_topic
+		        direction, experience, interview_target, qualification_step, next_topic,
+		        strong_zones, weak_zones_input
 		 FROM sessions
 		 WHERE student_id = $1 AND ended_at IS NULL
 		 ORDER BY started_at DESC
@@ -171,7 +175,8 @@ func (r *Repository) GetActiveSession(ctx context.Context, studentID int64) (*Se
 		studentID,
 	).Scan(&s.ID, &s.StudentID, &s.StartedAt, &s.EndedAt, &s.Status, &s.CycleCount,
 		&s.CurrentGrade, &s.Grade, &s.StudentRequest, &s.SelfAssessment, &s.WeakTopics, &s.CurrentQuestionID,
-		&s.Direction, &s.Experience, &s.InterviewTarget, &s.QualificationStep, &s.NextTopic)
+		&s.Direction, &s.Experience, &s.InterviewTarget, &s.QualificationStep, &s.NextTopic,
+		&s.StrongZones, &s.WeakZonesInput)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNoActiveSession
 	}
@@ -187,14 +192,14 @@ func (r *Repository) GetActiveSession(ctx context.Context, studentID int64) (*Se
 func (r *Repository) SetQualificationAnswer(ctx context.Context, sessionID int64, step int, answer string) error {
 	var query string
 	switch step {
-	case QualificationStepGrade:
-		query = `UPDATE sessions SET grade = $2, qualification_step = 1 WHERE id = $1 AND status = 'QUALIFICATION' AND qualification_step = 0`
-	case QualificationStepDirection:
-		query = `UPDATE sessions SET direction = $2, qualification_step = 2 WHERE id = $1 AND status = 'QUALIFICATION' AND qualification_step = 1`
-	case QualificationStepExperience:
-		query = `UPDATE sessions SET experience = $2, qualification_step = 3 WHERE id = $1 AND status = 'QUALIFICATION' AND qualification_step = 2`
-	case QualificationStepInterviewTarget:
-		query = `UPDATE sessions SET interview_target = $2, qualification_step = 4 WHERE id = $1 AND status = 'QUALIFICATION' AND qualification_step = 3`
+	case QualificationStepCurrentGrade:
+		query = `UPDATE sessions SET current_grade = $2, qualification_step = 1 WHERE id = $1 AND status = 'QUALIFICATION' AND qualification_step = 0`
+	case QualificationStepTargetGrade:
+		query = `UPDATE sessions SET grade = $2, qualification_step = 2 WHERE id = $1 AND status = 'QUALIFICATION' AND qualification_step = 1`
+	case QualificationStepStrongZones:
+		query = `UPDATE sessions SET strong_zones = $2, qualification_step = 3 WHERE id = $1 AND status = 'QUALIFICATION' AND qualification_step = 2`
+	case QualificationStepWeakZones:
+		query = `UPDATE sessions SET weak_zones_input = $2, qualification_step = 4 WHERE id = $1 AND status = 'QUALIFICATION' AND qualification_step = 3`
 	default:
 		return fmt.Errorf("set qualification answer: invalid step %d", step)
 	}
@@ -214,26 +219,87 @@ func (r *Repository) SetQualificationAnswer(ctx context.Context, sessionID int64
 // question tracking in internal/handlers always start from a clean
 // slate right after a transition.
 func (r *Repository) AdvancePhase(ctx context.Context, sessionID int64, newStatus string) error {
-	expectedStatus := map[string]string{
-		SessionStatusQualification: SessionStatusInstruction,
-		SessionStatusAudit:         SessionStatusQualification,
-		SessionStatusQuestionCycle: SessionStatusAudit,
-		SessionStatusSummary:       SessionStatusQuestionCycle,
+	expectedStatuses := map[string][]string{
+		SessionStatusQualification:       {SessionStatusInstruction},
+		SessionStatusProfileConfirmation: {SessionStatusQualification},
+		SessionStatusQuestionCycle:       {SessionStatusKDIRLesson, SessionStatusAudit},
+		SessionStatusSummary:             {SessionStatusQuestionCycle},
 	}[newStatus]
-	if expectedStatus == "" {
+	if len(expectedStatuses) == 0 {
 		return fmt.Errorf("advance phase: invalid target status %q", newStatus)
 	}
 	tag, err := r.pool.Exec(ctx,
 		`UPDATE sessions
 		 SET status = $2, cycle_count = 0, current_question_id = NULL
-		 WHERE id = $1 AND status = $3 AND ended_at IS NULL`,
-		sessionID, newStatus, expectedStatus,
+		 WHERE id = $1 AND status = ANY($3) AND ended_at IS NULL`,
+		sessionID, newStatus, expectedStatuses,
 	)
 	if err != nil {
 		return fmt.Errorf("advance phase: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("advance phase: session %d is not in expected status %s", sessionID, expectedStatus)
+		return fmt.Errorf("advance phase: session %d is not in expected statuses %v", sessionID, expectedStatuses)
+	}
+	return nil
+}
+
+// ResetQualification discards an unconfirmed profile and restarts all four
+// deterministic questions from the beginning.
+func (r *Repository) ResetQualification(ctx context.Context, sessionID int64) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE sessions
+		 SET status = $2,
+		     current_grade = '', grade = '', strong_zones = '', weak_zones_input = '',
+		     weak_topics = '', qualification_step = 0
+		 WHERE id = $1 AND status = $3 AND ended_at IS NULL`,
+		sessionID, SessionStatusQualification, SessionStatusProfileConfirmation,
+	)
+	if err != nil {
+		return fmt.Errorf("reset qualification: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("reset qualification: session %d is not waiting for confirmation", sessionID)
+	}
+	return nil
+}
+
+// ConfirmQualification persists the deterministic topic mapping, records the
+// self-reported weak zones as hypotheses and advances to the KDIR lesson.
+func (r *Repository) ConfirmQualification(ctx context.Context, sessionID, studentID int64, topics []string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("confirm qualification begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE sessions
+		 SET status = $2, weak_topics = $3
+		 WHERE id = $1 AND status = $4 AND qualification_step = $5 AND ended_at IS NULL`,
+		sessionID, SessionStatusKDIRLesson, strings.Join(topics, ","),
+		SessionStatusProfileConfirmation, QualificationStepDone,
+	)
+	if err != nil {
+		return fmt.Errorf("confirm qualification update session: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("confirm qualification: session %d is not waiting for confirmation", sessionID)
+	}
+
+	for _, topic := range topics {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO weak_zones (student_id, zone_text, status)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (student_id, zone_text)
+			 DO UPDATE SET status = EXCLUDED.status, updated_at = now()`,
+			studentID, topic, WeakZoneStatusHypothesis,
+		); err != nil {
+			return fmt.Errorf("confirm qualification weak zone %q: %w", topic, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("confirm qualification commit: %w", err)
 	}
 	return nil
 }
@@ -351,7 +417,8 @@ func (r *Repository) GetWeakZones(ctx context.Context, studentID int64) ([]WeakZ
 // which questions existing candidates receive.
 func (r *Repository) PickQuestion(ctx context.Context, grade, topic string) (*QuestionBank, error) {
 	query := `
-		SELECT id, question_text, grade, topic, followup_1, followup_2,
+		SELECT id, question_text, question_context, grade, topic,
+		       followup_1, followup_1_context, followup_2, followup_2_context,
 		       answer_junior, answer_middle, answer_senior, source
 		FROM question_bank
 		WHERE grade = ANY($1)`
@@ -365,7 +432,8 @@ func (r *Repository) PickQuestion(ctx context.Context, grade, topic string) (*Qu
 
 	q := &QuestionBank{}
 	err := r.pool.QueryRow(ctx, query, args...).Scan(
-		&q.ID, &q.QuestionText, &q.Grade, &q.Topic, &q.Followup1, &q.Followup2,
+		&q.ID, &q.QuestionText, &q.QuestionContext, &q.Grade, &q.Topic,
+		&q.Followup1, &q.Followup1Context, &q.Followup2, &q.Followup2Context,
 		&q.AnswerJunior, &q.AnswerMiddle, &q.AnswerSenior, &q.Source,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -383,7 +451,8 @@ func (r *Repository) PickQuestion(ctx context.Context, grade, topic string) (*Qu
 // exhausted.
 func (r *Repository) PickQuestionForSession(ctx context.Context, sessionID int64, grade, topic string) (*QuestionBank, error) {
 	query := `
-		SELECT q.id, q.question_text, q.grade, q.topic, q.followup_1, q.followup_2,
+		SELECT q.id, q.question_text, q.question_context, q.grade, q.topic,
+		       q.followup_1, q.followup_1_context, q.followup_2, q.followup_2_context,
 		       q.answer_junior, q.answer_middle, q.answer_senior, q.source
 		FROM question_bank q
 		WHERE q.grade = ANY($2)
@@ -400,7 +469,8 @@ func (r *Repository) PickQuestionForSession(ctx context.Context, sessionID int64
 
 	q := &QuestionBank{}
 	err := r.pool.QueryRow(ctx, query, args...).Scan(
-		&q.ID, &q.QuestionText, &q.Grade, &q.Topic, &q.Followup1, &q.Followup2,
+		&q.ID, &q.QuestionText, &q.QuestionContext, &q.Grade, &q.Topic,
+		&q.Followup1, &q.Followup1Context, &q.Followup2, &q.Followup2Context,
 		&q.AnswerJunior, &q.AnswerMiddle, &q.AnswerSenior, &q.Source,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -435,13 +505,15 @@ func compatibleQuestionGrades(grade string) []string {
 func (r *Repository) GetQuestionByID(ctx context.Context, id int64) (*QuestionBank, error) {
 	q := &QuestionBank{}
 	err := r.pool.QueryRow(ctx,
-		`SELECT id, question_text, grade, topic, followup_1, followup_2,
+		`SELECT id, question_text, question_context, grade, topic,
+		        followup_1, followup_1_context, followup_2, followup_2_context,
 		        answer_junior, answer_middle, answer_senior, source
 		 FROM question_bank
 		 WHERE id = $1`,
 		id,
 	).Scan(
-		&q.ID, &q.QuestionText, &q.Grade, &q.Topic, &q.Followup1, &q.Followup2,
+		&q.ID, &q.QuestionText, &q.QuestionContext, &q.Grade, &q.Topic,
+		&q.Followup1, &q.Followup1Context, &q.Followup2, &q.Followup2Context,
 		&q.AnswerJunior, &q.AnswerMiddle, &q.AnswerSenior, &q.Source,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -454,7 +526,7 @@ func (r *Repository) GetQuestionByID(ctx context.Context, id int64) (*QuestionBa
 }
 
 // StartQuestionAttempt atomically points the session at questionID and creates
-// the durable two-answer cycle that will receive the student's next messages.
+// the durable three-answer block that will receive the student's next messages.
 func (r *Repository) StartQuestionAttempt(ctx context.Context, sessionID, questionID int64) (*QuestionAttempt, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -480,12 +552,16 @@ func (r *Repository) StartQuestionAttempt(ctx context.Context, sessionID, questi
 		`INSERT INTO question_attempts (session_id, question_id)
 		 VALUES ($1, $2)
 		 RETURNING id, session_id, question_id, primary_answer, primary_feedback,
-		           followup_question, followup_answer, final_feedback, selected_vector,
+		           followup_question, followup_answer, followup_feedback,
+		           followup_2_question, followup_2_answer, followup_2_feedback,
+		           final_feedback, selected_vector,
 		           status, created_at, updated_at`,
 		sessionID, questionID,
 	).Scan(
 		&a.ID, &a.SessionID, &a.QuestionID, &a.PrimaryAnswer, &a.PrimaryFeedback,
-		&a.FollowupQuestion, &a.FollowupAnswer, &a.FinalFeedback, &a.SelectedVector,
+		&a.FollowupQuestion, &a.FollowupAnswer, &a.FollowupFeedback,
+		&a.Followup2Question, &a.Followup2Answer, &a.Followup2Feedback,
+		&a.FinalFeedback, &a.SelectedVector,
 		&a.Status, &a.CreatedAt, &a.UpdatedAt,
 	)
 	if err != nil {
@@ -503,7 +579,9 @@ func (r *Repository) GetActiveQuestionAttempt(ctx context.Context, sessionID int
 	a := &QuestionAttempt{}
 	err := r.pool.QueryRow(ctx,
 		`SELECT id, session_id, question_id, primary_answer, primary_feedback,
-		        followup_question, followup_answer, final_feedback, selected_vector,
+		        followup_question, followup_answer, followup_feedback,
+		        followup_2_question, followup_2_answer, followup_2_feedback,
+		        final_feedback, selected_vector,
 		        status, created_at, updated_at
 		 FROM question_attempts
 		 WHERE session_id = $1 AND status <> $2
@@ -512,7 +590,9 @@ func (r *Repository) GetActiveQuestionAttempt(ctx context.Context, sessionID int
 		sessionID, QuestionAttemptCompleted,
 	).Scan(
 		&a.ID, &a.SessionID, &a.QuestionID, &a.PrimaryAnswer, &a.PrimaryFeedback,
-		&a.FollowupQuestion, &a.FollowupAnswer, &a.FinalFeedback, &a.SelectedVector,
+		&a.FollowupQuestion, &a.FollowupAnswer, &a.FollowupFeedback,
+		&a.Followup2Question, &a.Followup2Answer, &a.Followup2Feedback,
+		&a.FinalFeedback, &a.SelectedVector,
 		&a.Status, &a.CreatedAt, &a.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -563,10 +643,46 @@ func (r *Repository) MarkPrimaryFeedbackDelivered(ctx context.Context, attemptID
 	return nil
 }
 
-// FinalizeQuestionAttempt atomically stores the second answer and feedback,
+// SaveFollowupFeedback stores the second answer and its mini-feedback. The
+// second follow-up becomes consumable only after both outbound messages arrive.
+func (r *Repository) SaveFollowupFeedback(ctx context.Context, attemptID int64, answer, feedback, followup2Question string) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE question_attempts
+		 SET followup_answer = $2, followup_feedback = $3, followup_2_question = $4,
+		     status = $5, updated_at = now()
+		 WHERE id = $1 AND status = $6`,
+		attemptID, answer, feedback, followup2Question,
+		QuestionAttemptFollowupFeedbackReady, QuestionAttemptWaitingFollowup,
+	)
+	if err != nil {
+		return fmt.Errorf("save followup feedback: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("save followup feedback: attempt %d is not waiting for a follow-up answer", attemptID)
+	}
+	return nil
+}
+
+func (r *Repository) MarkFollowupFeedbackDelivered(ctx context.Context, attemptID int64) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE question_attempts SET status = $2, updated_at = now()
+		 WHERE id = $1 AND status = $3`,
+		attemptID, QuestionAttemptWaitingFollowup2, QuestionAttemptFollowupFeedbackReady,
+	)
+	if err != nil {
+		return fmt.Errorf("mark followup feedback delivered: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("mark followup feedback delivered: attempt %d is not ready", attemptID)
+	}
+	return nil
+}
+
+// FinalizeQuestionAttempt atomically stores the third answer, its mini-feedback
+// and the full block feedback,
 // updates the evidence-backed weak-zone status, and increments the count of
 // fully evaluated cycles.
-func (r *Repository) FinalizeQuestionAttempt(ctx context.Context, sessionID, studentID, attemptID int64, answer, feedback, zoneTopic, zoneStatus string) (int, error) {
+func (r *Repository) FinalizeQuestionAttempt(ctx context.Context, sessionID, studentID, attemptID int64, answer, miniFeedback, fullFeedback, zoneTopic, zoneStatus string) (int, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("finalize question attempt begin: %w", err)
@@ -575,16 +691,17 @@ func (r *Repository) FinalizeQuestionAttempt(ctx context.Context, sessionID, stu
 
 	tag, err := tx.Exec(ctx,
 		`UPDATE question_attempts
-		 SET followup_answer = $2, final_feedback = $3, status = $4, updated_at = now()
-		 WHERE id = $1 AND session_id = $5 AND status = $6`,
-		attemptID, answer, feedback, QuestionAttemptFinalFeedbackReady,
-		sessionID, QuestionAttemptWaitingFollowup,
+		 SET followup_2_answer = $2, followup_2_feedback = $3, final_feedback = $4,
+		     status = $5, updated_at = now()
+		 WHERE id = $1 AND session_id = $6 AND status = $7`,
+		attemptID, answer, miniFeedback, fullFeedback, QuestionAttemptFinalFeedbackReady,
+		sessionID, QuestionAttemptWaitingFollowup2,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("finalize question attempt update attempt: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return 0, fmt.Errorf("finalize question attempt: attempt %d is not waiting for a follow-up answer", attemptID)
+		return 0, fmt.Errorf("finalize question attempt: attempt %d is not waiting for the second follow-up answer", attemptID)
 	}
 
 	if zoneTopic != "" {
@@ -681,7 +798,8 @@ func (r *Repository) CompleteQuestionAttempt(ctx context.Context, sessionID, att
 func (r *Repository) GetSessionAttemptReports(ctx context.Context, sessionID int64) ([]QuestionAttemptReport, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT q.question_text, q.topic, a.primary_answer, a.followup_question,
-		        a.followup_answer, a.final_feedback
+		        a.followup_answer, a.followup_2_question, a.followup_2_answer,
+		        a.final_feedback
 		 FROM question_attempts a
 		 JOIN question_bank q ON q.id = a.question_id
 		 WHERE a.session_id = $1 AND a.status = $2
@@ -698,7 +816,8 @@ func (r *Repository) GetSessionAttemptReports(ctx context.Context, sessionID int
 		var report QuestionAttemptReport
 		if err := rows.Scan(
 			&report.QuestionText, &report.Topic, &report.PrimaryAnswer,
-			&report.FollowupQuestion, &report.FollowupAnswer, &report.FinalFeedback,
+			&report.FollowupQuestion, &report.FollowupAnswer,
+			&report.Followup2Question, &report.Followup2Answer, &report.FinalFeedback,
 		); err != nil {
 			return nil, fmt.Errorf("scan session attempt report: %w", err)
 		}

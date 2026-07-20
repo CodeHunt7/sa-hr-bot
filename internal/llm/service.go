@@ -33,16 +33,26 @@ type sessionQuestionPicker interface {
 	PickQuestionForSession(ctx context.Context, sessionID int64, grade, topic string) (*db.QuestionBank, error)
 }
 
-// StudentProfile is the compact learner profile folded into every user
-// message: the target grade, never the full qualification transcript.
+// StudentProfile is the compact learner profile folded into every evaluation
+// request. Grade is retained as a compatibility alias for TargetGrade while
+// older sessions/tests are migrated.
 type StudentProfile struct {
-	Grade string // target grade, e.g. "джун", "джун-мидл", "мидл", "мидл-сеньор", "сеньор"
+	Grade        string
+	CurrentGrade string
+	TargetGrade  string
+	StrongZones  string
+	WeakZones    string
 }
 
-// QualificationProfile contains the four answers collected by the
-// deterministic qualification flow. Unlike the old marker-based flow, these
-// values are stored verbatim and passed together to the audit call.
+// QualificationProfile contains the deterministic onboarding answers used by
+// summary. Legacy fields remain available for an older active session.
 type QualificationProfile struct {
+	CurrentGrade string
+	TargetGrade  string
+	StrongZones  string
+	WeakZones    string
+
+	// Legacy pre-stakeholder-onboarding fields.
 	Grade           string
 	Direction       string
 	Experience      string
@@ -151,7 +161,12 @@ func (s *Service) PickQuestionForSession(ctx context.Context, sessionID int64, g
 func BuildUserContext(profile StudentProfile, weakZones []db.WeakZone, recentTurns []Turn, question *db.QuestionBank) string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "Профиль кандидата:\nЦелевой грейд: %s\n", profile.Grade)
+	targetGrade := profile.TargetGrade
+	if targetGrade == "" {
+		targetGrade = profile.Grade
+	}
+	fmt.Fprintf(&b, "Профиль кандидата:\nТекущий грейд: %s\nЦелевой грейд: %s\n", profile.CurrentGrade, targetGrade)
+	fmt.Fprintf(&b, "Сильные зоны по самооценке: %s\nСлабые зоны по самооценке: %s\n", profile.StrongZones, profile.WeakZones)
 
 	b.WriteString("\nКарта слабых зон:\n")
 	if len(weakZones) == 0 {
@@ -163,9 +178,10 @@ func BuildUserContext(profile StudentProfile, weakZones []db.WeakZone, recentTur
 	}
 
 	if question != nil {
-		fmt.Fprintf(&b, "\nВопрос из банка (id %d, грейд %s, тема %s):\n%s\n",
-			question.ID, question.Grade, question.Topic, question.QuestionText)
-		fmt.Fprintf(&b, "Follow-up 1: %s\nFollow-up 2: %s\n", question.Followup1, question.Followup2)
+		fmt.Fprintf(&b, "\nВопрос из банка (id %d, грейд %s, тема %s):\nКонтекст: %s\n%s\n",
+			question.ID, question.Grade, question.Topic, question.QuestionContext, question.QuestionText)
+		fmt.Fprintf(&b, "Follow-up 1 (%s): %s\nFollow-up 2 (%s): %s\n",
+			question.Followup1Context, question.Followup1, question.Followup2Context, question.Followup2)
 		fmt.Fprintf(&b, "Эталон джун: %s\nЭталон мидл: %s\nЭталон сеньор: %s\n",
 			question.AnswerJunior, question.AnswerMiddle, question.AnswerSenior)
 	}
@@ -219,6 +235,7 @@ func BuildAuditContext(profile QualificationProfile, weakZones []db.WeakZone) st
 func BuildEvaluationContext(profile StudentProfile, weakZones []db.WeakZone, studentAnswer string, question *db.QuestionBank) string {
 	var b strings.Builder
 	b.WriteString("Текущая задача: ФАЗА 3, оцени ответ кандидата на уже заданный технический вопрос.\n")
+	b.WriteString("В этом сообщении говори в роли HR, который проводит техническое собеседование.\n")
 	b.WriteString("Не повторяй инструкцию. Не начинай квалификацию. Не спрашивай грейд, направление, опыт или дату собеседования.\n")
 	b.WriteString("Даже если ответ бессмысленный, грубый или не относится к вопросу, оставайся в Фазе 3. Прямо скажи, что ответ не раскрывает тему, и кратко объясни, чего не хватило.\n")
 	b.WriteString("Верни только одну рамку `▸ ОБРАТНАЯ СВЯЗЬ`. Не задавай следующий вопрос и не начинай новую фазу: уточнение из банка вопросов отправит код.\n\n")
@@ -232,16 +249,14 @@ func (s *Service) Evaluate(ctx context.Context, profile StudentProfile, weakZone
 	return s.Reply(ctx, BuildEvaluationContext(profile, weakZones, studentAnswer, question))
 }
 
-// BuildFollowupEvaluationContext supplies both answers from one question cycle
-// and pins the model to the final feedback steps of phase 3.
+// BuildFollowupEvaluationContext asks only for the mini-feedback after the
+// first follow-up. The code sends the bank's second follow-up afterwards.
 func BuildFollowupEvaluationContext(profile StudentProfile, weakZones []db.WeakZone, primaryAnswer, followupQuestion, followupAnswer string, question *db.QuestionBank) string {
 	var b strings.Builder
-	b.WriteString("Текущая задача: ФАЗА 3, шаги 5 и 6. Разбери ответ на уточнение и всю связку из двух ответов.\n")
-	b.WriteString("Не повторяй инструкцию и квалификацию. Не спрашивай грейд. Не задавай новый вопрос.\n")
-	b.WriteString("Сначала дай рамку `▸ ОБРАТНАЯ СВЯЗЬ` и скажи, закрыт ли пробел после уточнения.\n")
-	b.WriteString("Затем дай рамку `▸ ПОЛНАЯ ОБРАТНАЯ СВЯЗЬ` по формуле Контекст, Выбор, Аргумент, Результат.\n")
-	b.WriteString("Затем покажи полную рамку `▸ КАРТА СЛАБЫХ МЕСТ (обновлено)` с текущими зонами и темой этого вопроса.\n")
-	b.WriteString("В самом конце добавь служебную строку `WEAK_ZONE_STATUS: confirmed`, если пробел остался, или `WEAK_ZONE_STATUS: closed`, если кандидат исправился. Других служебных строк не добавляй.\n")
+	b.WriteString("Текущая задача: ФАЗА 3. Дай короткую обратную связь только на ответ кандидата на первый уточняющий вопрос.\n")
+	b.WriteString("В этом сообщении говори в роли HR, который проводит техническое собеседование.\n")
+	b.WriteString("Не повторяй инструкцию и квалификацию. Не спрашивай грейд. Не задавай новый вопрос и не давай большой разбор блока.\n")
+	b.WriteString("Верни только одну рамку `▸ ОБРАТНАЯ СВЯЗЬ`: конкретно укажи, что ответ раскрыл и чего в нем не хватило.\n")
 	b.WriteString("Даже если один из ответов грубый или бессмысленный, оставайся в этой задаче и оцени отсутствие содержательного ответа прямо.\n\n")
 	b.WriteString(BuildUserContext(profile, weakZones, nil, question))
 	fmt.Fprintf(&b, "\nОсновной ответ кандидата:\n%s\n", primaryAnswer)
@@ -250,10 +265,38 @@ func BuildFollowupEvaluationContext(profile StudentProfile, weakZones []db.WeakZ
 	return b.String()
 }
 
-// EvaluateFollowup produces the full-cycle feedback after the second answer.
+// EvaluateFollowup produces mini-feedback after the second answer.
 func (s *Service) EvaluateFollowup(ctx context.Context, profile StudentProfile, weakZones []db.WeakZone, primaryAnswer, followupQuestion, followupAnswer string, question *db.QuestionBank) (*Reply, error) {
 	return s.Reply(ctx, BuildFollowupEvaluationContext(
 		profile, weakZones, primaryAnswer, followupQuestion, followupAnswer, question,
+	))
+}
+
+// BuildBlockEvaluationContext asks for the mini-feedback on answer three and
+// then one evidence-based review of all three answers using the approved KDIR
+// structure. A service marker updates the weak-zone map but is hidden from the
+// candidate by the handler.
+func BuildBlockEvaluationContext(profile StudentProfile, weakZones []db.WeakZone, primaryAnswer, followup1Question, followup1Answer, followup2Question, followup2Answer string, question *db.QuestionBank) string {
+	var b strings.Builder
+	b.WriteString("Текущая задача: ФАЗА 3. Кандидат ответил на основной вопрос и два уточнения. Заверши блок.\n")
+	b.WriteString("В этом сообщении говори в роли HR, который проводит техническое собеседование.\n")
+	b.WriteString("Не повторяй инструкцию и квалификацию. Не спрашивай грейд и не задавай новый вопрос.\n")
+	b.WriteString("Сначала дай одну короткую рамку `▸ ОБРАТНАЯ СВЯЗЬ` только по ответу на второе уточнение.\n")
+	b.WriteString("Затем дай отдельную рамку `▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ` по всей связке из трех ответов. Обязательно используй формулу КДИР: Контекст, Действие, Инструмент, Результат. Для каждого пункта укажи, что было и чего не хватило.\n")
+	b.WriteString("В конце большой рамки добавь короткий пример более сильного ответа, опираясь только на вопрос, эталоны и факты кандидата. Не приписывай кандидату выдуманный опыт.\n")
+	b.WriteString("В самом конце добавь служебную строку `WEAK_ZONE_STATUS: confirmed`, если пробел по теме остался, или `WEAK_ZONE_STATUS: closed`, если кандидат его закрыл. Других служебных строк не добавляй.\n")
+	b.WriteString("Даже если ответ грубый, бессмысленный или не относится к вопросу, не меняй фазу и прямо оцени отсутствие содержательного ответа.\n\n")
+	b.WriteString(BuildUserContext(profile, weakZones, nil, question))
+	fmt.Fprintf(&b, "\nОсновной ответ кандидата:\n%s\n", primaryAnswer)
+	fmt.Fprintf(&b, "\nПервый уточняющий вопрос:\n%s\nОтвет:\n%s\n", followup1Question, followup1Answer)
+	fmt.Fprintf(&b, "\nВторой уточняющий вопрос:\n%s\nОтвет:\n%s\n", followup2Question, followup2Answer)
+	return b.String()
+}
+
+func (s *Service) EvaluateBlock(ctx context.Context, profile StudentProfile, weakZones []db.WeakZone, primaryAnswer, followup1Question, followup1Answer, followup2Question, followup2Answer string, question *db.QuestionBank) (*Reply, error) {
+	return s.Reply(ctx, BuildBlockEvaluationContext(
+		profile, weakZones, primaryAnswer, followup1Question, followup1Answer,
+		followup2Question, followup2Answer, question,
 	))
 }
 
@@ -264,10 +307,17 @@ func BuildSummaryContext(profile QualificationProfile, weakZones []db.WeakZone, 
 	b.WriteString("Текущая задача: ФАЗА 4, итоговый отчет по завершенной сессии.\n")
 	b.WriteString("Не повторяй инструкцию, квалификацию или вопросы. Используй только факты ниже.\n")
 	b.WriteString("Дай краткую итоговую карту слабых зон и 2-3 конкретные рекомендации перед собеседованием.\n\n")
-	fmt.Fprintf(&b, "Грейд кандидата: %s\n", profile.Grade)
-	fmt.Fprintf(&b, "Направление и индустрия: %s\n", profile.Direction)
-	fmt.Fprintf(&b, "Исходный опыт и пробелы: %s\n", profile.Experience)
-	fmt.Fprintf(&b, "Вакансия или дата собеседования: %s\n", profile.InterviewTarget)
+	if profile.TargetGrade != "" || profile.CurrentGrade != "" || profile.StrongZones != "" || profile.WeakZones != "" {
+		fmt.Fprintf(&b, "Текущий грейд: %s\n", profile.CurrentGrade)
+		fmt.Fprintf(&b, "Целевой грейд: %s\n", profile.TargetGrade)
+		fmt.Fprintf(&b, "Сильные зоны по самооценке: %s\n", profile.StrongZones)
+		fmt.Fprintf(&b, "Слабые зоны по самооценке: %s\n", profile.WeakZones)
+	} else {
+		fmt.Fprintf(&b, "Грейд кандидата: %s\n", profile.Grade)
+		fmt.Fprintf(&b, "Направление и индустрия: %s\n", profile.Direction)
+		fmt.Fprintf(&b, "Исходный опыт и пробелы: %s\n", profile.Experience)
+		fmt.Fprintf(&b, "Вакансия или дата собеседования: %s\n", profile.InterviewTarget)
+	}
 
 	b.WriteString("\nКарта слабых зон:\n")
 	if len(weakZones) == 0 {
@@ -288,6 +338,8 @@ func BuildSummaryContext(profile QualificationProfile, weakZones []db.WeakZone, 
 			fmt.Fprintf(&b, "Основной ответ: %s\n", attempt.PrimaryAnswer)
 			fmt.Fprintf(&b, "Уточнение: %s\n", attempt.FollowupQuestion)
 			fmt.Fprintf(&b, "Ответ на уточнение: %s\n", attempt.FollowupAnswer)
+			fmt.Fprintf(&b, "Второе уточнение: %s\n", attempt.Followup2Question)
+			fmt.Fprintf(&b, "Ответ на второе уточнение: %s\n", attempt.Followup2Answer)
 			fmt.Fprintf(&b, "Зафиксированная обратная связь: %s\n", attempt.FinalFeedback)
 		}
 	}

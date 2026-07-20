@@ -59,7 +59,7 @@ func TestNewService_SubstitutesSessionCycleLimit(t *testing.T) {
 	if strings.Contains(svc.systemPrompt, sessionCycleLimitPlaceholder) {
 		t.Fatalf("systemPrompt still contains unresolved placeholder: %q", svc.systemPrompt)
 	}
-	if !strings.Contains(svc.systemPrompt, "лимит в 8 циклов") {
+	if !strings.Contains(svc.systemPrompt, "8 завершенных блоков") {
 		t.Fatalf("systemPrompt does not contain substituted limit: %q", svc.systemPrompt)
 	}
 }
@@ -190,8 +190,9 @@ func TestBuildUserContext(t *testing.T) {
 		{Role: "assistant", Content: "последняя реплика"},
 	}
 	question := &db.QuestionBank{
-		ID: 42, Grade: "джун", Topic: "бд", QuestionText: "Что такое нормализация?",
-		Followup1: "А что такое 3НФ?", Followup2: "Приведи пример денормализации",
+		ID: 42, Grade: "джун", Topic: "бд", QuestionText: "Что такое нормализация?", QuestionContext: "Контекст БД",
+		Followup1: "А что такое 3НФ?", Followup1Context: "Контекст уточнения 1",
+		Followup2: "Приведи пример денормализации", Followup2Context: "Контекст уточнения 2",
 		AnswerJunior: "джун ответ", AnswerMiddle: "мидл ответ", AnswerSenior: "сеньор ответ",
 	}
 
@@ -202,7 +203,7 @@ func TestBuildUserContext(t *testing.T) {
 		"интеграции: hypothesis",
 		"требования: confirmed",
 		"Что такое нормализация?",
-		"Follow-up 1: А что такое 3НФ?",
+		"Follow-up 1 (Контекст уточнения 1): А что такое 3НФ?",
 		"Эталон сеньор: сеньор ответ",
 		"предпоследняя реплика",
 		"последняя реплика",
@@ -297,12 +298,30 @@ func TestBuildFollowupEvaluationContext_IncludesBothAnswersAndPinsPhase(t *testi
 	)
 
 	for _, want := range []string{
-		"ФАЗА 3", "шаги 5 и 6", "первый ответ", "почему выбрал REST?",
-		"ответ на уточнение", "ПОЛНАЯ ОБРАТНАЯ СВЯЗЬ", "WEAK_ZONE_STATUS",
-		"Не спрашивай грейд",
+		"ФАЗА 3", "первый уточняющий вопрос", "первый ответ", "почему выбрал REST?",
+		"ответ на уточнение", "только одну рамку", "Не спрашивай грейд",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("follow-up context does not contain %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestBuildBlockEvaluationContext_IncludesThreeAnswersAndKDIR(t *testing.T) {
+	question := &db.QuestionBank{ID: 8, QuestionText: "Как описать API?", Topic: "интеграции"}
+	got := BuildBlockEvaluationContext(
+		StudentProfile{TargetGrade: "мидл"}, nil,
+		"основной ответ", "уточнение один", "ответ два",
+		"уточнение два", "ответ три", question,
+	)
+
+	for _, want := range []string{
+		"ФАЗА 3", "основной ответ", "уточнение один", "ответ два",
+		"уточнение два", "ответ три", "БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ",
+		"Контекст, Действие, Инструмент, Результат", "WEAK_ZONE_STATUS",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("block context does not contain %q:\n%s", want, got)
 		}
 	}
 }
@@ -317,12 +336,13 @@ func TestBuildSummaryContext_UsesPersistedAttempts(t *testing.T) {
 		[]db.QuestionAttemptReport{{
 			QuestionText: "Что такое индекс?", Topic: "бд",
 			PrimaryAnswer: "первый", FollowupQuestion: "когда вредит?",
-			FollowupAnswer: "второй", FinalFeedback: "нужно больше конкретики",
+			FollowupAnswer: "второй", Followup2Question: "как измерить?",
+			Followup2Answer: "третий", FinalFeedback: "нужно больше конкретики",
 		}},
 	)
 
 	for _, want := range []string{
-		"ФАЗА 4", "Что такое индекс?", "первый", "когда вредит?", "второй",
+		"ФАЗА 4", "Что такое индекс?", "первый", "когда вредит?", "второй", "как измерить?", "третий",
 		"нужно больше конкретики", "бд: confirmed", "финтех", "мало Kafka", "собеседование завтра",
 	} {
 		if !strings.Contains(got, want) {

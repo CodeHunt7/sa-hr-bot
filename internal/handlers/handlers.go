@@ -57,11 +57,52 @@ const (
 )
 
 const (
-	instructionMessage = "Сначала я задам четыре коротких вопроса, чтобы понять твой уровень и опыт. Затем покажу мини-аудит вероятных слабых зон. После этого начнем разбирать технические вопросы с обратной связью и уточнениями."
-	gradeQuestion      = "На какой грейд ты претендуешь или сейчас себя ощущаешь?"
-	directionQuestion  = "В каком направлении и индустрии у тебя основной опыт или куда хочешь перейти?"
-	experienceQuestion = "В каких задачах у тебя есть реальный опыт, а в каких его почти нет? Например: требования, интеграции, БД, UML, документация, тест-кейсы."
-	targetQuestion     = "Есть конкретная вакансия или дата собеседования, к которому готовишься? Если нет, так и напиши."
+	welcomePhotoPath = "media/pic1.PNG"
+	readyPhotoPath   = "media/pic2.PNG"
+
+	instructionMessage = `Привет. Меня зовут Катя Желатинка, я собрала для тебя тренажёр для отработки технических собеседований системного аналитика.
+
+Это не чат-бот общего назначения. Под капотом этого ИИ-агента зашито больше 150 вопросов, которые задают на собесах в 2026 года.
+
+Формат простой: сначала 4 коротких вопроса про тебя, чтобы лучше понять твой запрос. Дальше цикл вопросов с разбором каждого ответа. Фидбек получаешь сразу, без ожидания.
+
+Представь, что готовишься к экзамену на права для авто, все тоже самое, только готовимся к собеседованию.
+
+Я буду задавать тебе основной вопрос и два дополнительных, а после буду давать обратную связь и разъяснение по твоим ответам.
+
+Прежде чем начнём - 4 вопроса, чтобы подобрать нужный уровень сложности. Начинаем?`
+	currentGradeQuestion = "Вопрос 1/4\nКакой у тебя текущий грейд?"
+	targetGradeQuestion  = "Вопрос 2/4\nНа какой грейд собеседуешься?"
+	strongZonesQuestion  = `Вопрос 3/4
+Какие технические зоны ты знаешь лучше всего?
+
+Напиши ответ текстом:
+- Интеграции
+- Базы данных
+- Архитектура
+- Требования
+- Безопасность`
+	weakZonesQuestion = `Вопрос 4/4
+Какие технические зоны ты знаешь хуже всего?
+
+Напиши ответ текстом:
+- Интеграции
+- Базы данных
+- Архитектура
+- Требования
+- Безопасность`
+	kdirLessonMessage = `Отлично, режде чем начнём отработку - один короткий урок.
+
+Разбираю в нём формулу КДИР: Контекст, Действие, Инструмент, Результат.
+
+Это формула и способ, который позволит отвечать на технические вопросы так, чтобы сразу был виден масштаб задачи, что сделал именно ты, каким инструментом и какой результат получил.
+
+Без формулы ответ звучит как пересказ обязанностей. Сыро и иногда запутанно. А с ней, как конкретный кейс с цифрами, который HR может корректно оценить.
+
+Смотри урок, переходи к тренажеру, а дальше на каждом вопросе тренажёра жду от тебя ответ именно по этой структуре.
+
+Посмотри видео, потом жми «Готов(а)».`
+	readyPrompt = "Ситуация понятна. Приступим?"
 )
 
 // weakTopicsMarkerRE matches the WEAK_TOPICS: marker line the model
@@ -69,8 +110,10 @@ const (
 // "Технические метки" section. Stripped from what the student sees.
 var weakTopicsMarkerRE = regexp.MustCompile(`(?im)^[ \t]*WEAK_TOPICS[ \t]*:[ \t]*(.+?)[ \t]*$`)
 
-// weakZoneStatusMarkerRE is emitted only by the final two-answer evaluation.
+// weakZoneStatusMarkerRE is emitted only by the final three-answer evaluation.
 var weakZoneStatusMarkerRE = regexp.MustCompile(`(?im)^[ \t]*WEAK_ZONE_STATUS[ \t]*:[ \t]*(confirmed|closed)[ \t]*$`)
+
+var bigFeedbackHeadingRE = regexp.MustCompile(`(?im)^[ \t]*▸[ \t]*БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ[ \t]*$`)
 
 // validTopics mirrors question_bank.topic's allowed values (see
 // db.QuestionBank's doc comment). Used to discard any WEAK_TOPICS value
@@ -92,24 +135,44 @@ var (
 	btnRestart  = restartMenu.Data("Начать заново", "restart_session")
 	btnContinue = restartMenu.Data("Продолжить", "continue_session")
 
-	gradeMenu      = &tele.ReplyMarkup{}
-	btnGradeJunior = gradeMenu.Data("Джун", "qualification_grade", "джун")
-	btnGradeMiddle = gradeMenu.Data("Мидл", "qualification_grade", "мидл")
-	btnGradeSenior = gradeMenu.Data("Сеньор", "qualification_grade", "сеньор")
+	currentGradeMenu      = &tele.ReplyMarkup{}
+	btnCurrentGradeJunior = currentGradeMenu.Data("Джун", "qualification_current_grade", "джун")
+	btnCurrentGradeMiddle = currentGradeMenu.Data("Мидл", "qualification_current_grade", "мидл")
+	btnCurrentGradeSenior = currentGradeMenu.Data("Сеньор", "qualification_current_grade", "сеньор")
+
+	targetGradeMenu      = &tele.ReplyMarkup{}
+	btnTargetGradeJunior = targetGradeMenu.Data("Джун", "qualification_target_grade", "джун")
+	btnTargetGradeMiddle = targetGradeMenu.Data("Мидл", "qualification_target_grade", "мидл")
+	btnTargetGradeSenior = targetGradeMenu.Data("Сеньор", "qualification_target_grade", "сеньор")
+
+	confirmationMenu  = &tele.ReplyMarkup{}
+	btnConfirmProfile = confirmationMenu.Data("Да, все верно.", "qualification_confirm", "confirm")
+	btnEditProfile    = confirmationMenu.Data("Изменить ответы", "qualification_edit", "edit")
+
+	readyMenu = &tele.ReplyMarkup{}
+	btnReady  = readyMenu.Data("Готов(а), начинаем", "kdir_ready", "ready")
 
 	vectorMenu         = &tele.ReplyMarkup{}
 	btnVectorDeepen    = vectorMenu.Data("Углубиться в тему", "question_vector", "deepen")
 	btnVectorOtherWeak = vectorMenu.Data("Другая слабая зона", "question_vector", "other_weak")
 	btnVectorRandom    = vectorMenu.Data("Случайная тема", "question_vector", "random")
+	btnVectorFinish    = vectorMenu.Data("Завершить тренировку", "question_vector", "finish")
 )
 
 func init() {
 	restartMenu.Inline(restartMenu.Row(btnRestart, btnContinue))
-	gradeMenu.Inline(gradeMenu.Row(btnGradeJunior, btnGradeMiddle, btnGradeSenior))
+	currentGradeMenu.Inline(currentGradeMenu.Row(btnCurrentGradeJunior, btnCurrentGradeMiddle, btnCurrentGradeSenior))
+	targetGradeMenu.Inline(targetGradeMenu.Row(btnTargetGradeJunior, btnTargetGradeMiddle, btnTargetGradeSenior))
+	confirmationMenu.Inline(
+		confirmationMenu.Row(btnConfirmProfile),
+		confirmationMenu.Row(btnEditProfile),
+	)
+	readyMenu.Inline(readyMenu.Row(btnReady))
 	vectorMenu.Inline(
 		vectorMenu.Row(btnVectorDeepen),
 		vectorMenu.Row(btnVectorOtherWeak),
 		vectorMenu.Row(btnVectorRandom),
+		vectorMenu.Row(btnVectorFinish),
 	)
 }
 
@@ -122,6 +185,8 @@ type Repository interface {
 	EndSession(ctx context.Context, sessionID int64, status string) error
 	AdvancePhase(ctx context.Context, sessionID int64, newStatus string) error
 	SetQualificationAnswer(ctx context.Context, sessionID int64, step int, answer string) error
+	ResetQualification(ctx context.Context, sessionID int64) error
+	ConfirmQualification(ctx context.Context, sessionID, studentID int64, topics []string) error
 	SaveAuditResults(ctx context.Context, sessionID, studentID int64, topics []string) error
 	GetQuestionByID(ctx context.Context, id int64) (*db.QuestionBank, error)
 	GetWeakZones(ctx context.Context, studentID int64) ([]db.WeakZone, error)
@@ -129,7 +194,9 @@ type Repository interface {
 	GetActiveQuestionAttempt(ctx context.Context, sessionID int64) (*db.QuestionAttempt, error)
 	SavePrimaryFeedback(ctx context.Context, attemptID int64, answer, feedback, followupQuestion string) error
 	MarkPrimaryFeedbackDelivered(ctx context.Context, attemptID int64) error
-	FinalizeQuestionAttempt(ctx context.Context, sessionID, studentID, attemptID int64, answer, feedback, zoneTopic, zoneStatus string) (int, error)
+	SaveFollowupFeedback(ctx context.Context, attemptID int64, answer, feedback, followup2Question string) error
+	MarkFollowupFeedbackDelivered(ctx context.Context, attemptID int64) error
+	FinalizeQuestionAttempt(ctx context.Context, sessionID, studentID, attemptID int64, answer, miniFeedback, fullFeedback, zoneTopic, zoneStatus string) (int, error)
 	MarkFinalFeedbackDelivered(ctx context.Context, attemptID int64) error
 	CompleteQuestionAttempt(ctx context.Context, sessionID, attemptID int64, selectedVector, nextTopic string) error
 	GetSessionAttemptReports(ctx context.Context, sessionID int64) ([]db.QuestionAttemptReport, error)
@@ -143,6 +210,7 @@ type LLM interface {
 	Reply(ctx context.Context, userMessage string) (*llm.Reply, error)
 	Evaluate(ctx context.Context, profile llm.StudentProfile, weakZones []db.WeakZone, studentAnswer string, question *db.QuestionBank) (*llm.Reply, error)
 	EvaluateFollowup(ctx context.Context, profile llm.StudentProfile, weakZones []db.WeakZone, primaryAnswer, followupQuestion, followupAnswer string, question *db.QuestionBank) (*llm.Reply, error)
+	EvaluateBlock(ctx context.Context, profile llm.StudentProfile, weakZones []db.WeakZone, primaryAnswer, followup1Question, followup1Answer, followup2Question, followup2Answer string, question *db.QuestionBank) (*llm.Reply, error)
 	PickQuestion(ctx context.Context, grade, topic string) (*db.QuestionBank, error)
 	PickQuestionForSession(ctx context.Context, sessionID int64, grade, topic string) (*db.QuestionBank, error)
 }
@@ -163,8 +231,9 @@ type Handler struct {
 
 // New creates a Handler with its dependencies. sessionCycleLimit is the
 // same value substituted into the system prompt (SESSION_CYCLE_LIMIT);
-// the handler needs its own copy to know when to move QUESTION_CYCLE to
-// SUMMARY. adminIDs are the Telegram user IDs allowed to run /report.
+// the handler uses its copy to show a continue-or-finish checkpoint after each
+// configured number of completed blocks. adminIDs are the Telegram user IDs
+// allowed to run /report.
 func New(repo Repository, llmService LLM, logger *slog.Logger, sessionCycleLimit int, adminIDs []int64) *Handler {
 	ids := make(map[int64]bool, len(adminIDs))
 	for _, id := range adminIDs {
@@ -202,7 +271,11 @@ func (h *Handler) Register(bot *tele.Bot) {
 	h.handle(bot, "/report", h.handleReport)
 	h.handle(bot, &btnRestart, h.handleRestartCallback)
 	h.handle(bot, &btnContinue, h.handleContinueCallback)
-	h.handle(bot, &btnGradeJunior, h.handleGradeCallback)
+	h.handle(bot, &btnCurrentGradeJunior, h.handleGradeCallback)
+	h.handle(bot, &btnTargetGradeJunior, h.handleGradeCallback)
+	h.handle(bot, &btnConfirmProfile, h.handleConfirmProfileCallback)
+	h.handle(bot, &btnEditProfile, h.handleEditProfileCallback)
+	h.handle(bot, &btnReady, h.handleReadyCallback)
 	h.handle(bot, &btnVectorDeepen, h.handleVectorCallback)
 	h.handle(bot, tele.OnText, h.handleMessage)
 }
@@ -503,6 +576,10 @@ func (h *Handler) startFreshSession(ctx context.Context, c tele.Context, student
 		return c.Send(genericErrorMessage)
 	}
 
+	if err := sendPhoto(c, welcomePhotoPath); err != nil {
+		h.logger.Error("send welcome photo", "error", err, "session_id", session.ID)
+		return c.Send(genericErrorMessage)
+	}
 	if err := c.Send(instructionMessage); err != nil {
 		return err
 	}
@@ -511,7 +588,7 @@ func (h *Handler) startFreshSession(ctx context.Context, c tele.Context, student
 		h.logger.Error("advance phase", "error", err, "session_id", session.ID)
 		return c.Send(genericErrorMessage)
 	}
-	return c.Send(gradeQuestion, gradeMenu)
+	return c.Send(currentGradeQuestion, currentGradeMenu)
 }
 
 // handleGradeCallback stores the explicit grade button choice and advances to
@@ -541,19 +618,24 @@ func (h *Handler) handleGradeCallback(c tele.Context) error {
 		h.logger.Error("get active session", "error", err)
 		return c.Send(genericErrorMessage)
 	}
-	if session.Status != db.SessionStatusQualification || session.QualificationStep != db.QualificationStepGrade {
+	if session.Status != db.SessionStatusQualification ||
+		(session.QualificationStep != db.QualificationStepCurrentGrade && session.QualificationStep != db.QualificationStepTargetGrade) {
 		return c.Send("Этот выбор уже сохранён. Продолжаем с текущего шага.")
 	}
 
 	grade, ok := normalizeGrade(c.Data())
 	if !ok {
-		return c.Send("Выбери грейд кнопкой: джун, мидл или сеньор.", gradeMenu)
+		return c.Send("Выбери грейд кнопкой: джун, мидл или сеньор.", gradeMenuForStep(session.QualificationStep))
 	}
-	if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepGrade, grade); err != nil {
+	step := session.QualificationStep
+	if err := h.repo.SetQualificationAnswer(ctx, session.ID, step, grade); err != nil {
 		h.logger.Error("set qualification grade", "error", err, "session_id", session.ID)
 		return c.Send(genericErrorMessage)
 	}
-	return c.Send(directionQuestion)
+	if step == db.QualificationStepCurrentGrade {
+		return c.Send(targetGradeQuestion, targetGradeMenu)
+	}
+	return c.Send(strongZonesQuestion)
 }
 
 // handleRestartCallback ends the student's active session as abandoned
@@ -621,7 +703,7 @@ func (h *Handler) handleContinueCallback(c tele.Context) error {
 		return c.Send(genericErrorMessage)
 	}
 
-	_, err = h.repo.GetActiveSession(ctx, student.TelegramID)
+	session, err := h.repo.GetActiveSession(ctx, student.TelegramID)
 	if errors.Is(err, db.ErrNoActiveSession) {
 		return c.Send("Активной сессии уже нет. Напиши /start и код доступа, чтобы начать заново.")
 	}
@@ -630,7 +712,7 @@ func (h *Handler) handleContinueCallback(c tele.Context) error {
 		return c.Send(genericErrorMessage)
 	}
 
-	return c.Send("Хорошо, продолжаем с того места, где остановились. Пиши следующее сообщение.")
+	return h.resumeCurrentStep(ctx, c, session)
 }
 
 // handleMessage routes a plain text message to the phase-specific
@@ -665,6 +747,10 @@ func (h *Handler) handleMessage(c tele.Context) error {
 	switch session.Status {
 	case db.SessionStatusQualification:
 		return h.handleQualification(ctx, c, student, session)
+	case db.SessionStatusProfileConfirmation:
+		return c.Send("Проверь сохранённые ответы и выбери действие кнопкой.", confirmationMenu)
+	case db.SessionStatusKDIRLesson:
+		return c.Send("Когда будешь готов, нажми кнопку.", readyMenu)
 	case db.SessionStatusAudit:
 		return h.handleAudit(ctx, c, student, session)
 	case db.SessionStatusQuestionCycle:
@@ -691,48 +777,52 @@ func (h *Handler) handleQualification(ctx context.Context, c tele.Context, stude
 	}
 
 	switch session.QualificationStep {
-	case db.QualificationStepGrade:
+	case db.QualificationStepCurrentGrade:
 		grade, ok := normalizeGrade(answer)
 		if !ok {
-			return c.Send("Выбери грейд: джун, мидл или сеньор.", gradeMenu)
+			return c.Send("Выбери грейд: джун, мидл или сеньор.", currentGradeMenu)
 		}
-		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepGrade, grade); err != nil {
+		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepCurrentGrade, grade); err != nil {
 			return h.qualificationSaveError(c, session.ID, err)
 		}
-		return c.Send(directionQuestion)
+		return c.Send(targetGradeQuestion, targetGradeMenu)
 
-	case db.QualificationStepDirection:
-		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepDirection, answer); err != nil {
+	case db.QualificationStepTargetGrade:
+		grade, ok := normalizeGrade(answer)
+		if !ok {
+			return c.Send("Выбери грейд: джун, мидл или сеньор.", targetGradeMenu)
+		}
+		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepTargetGrade, grade); err != nil {
 			return h.qualificationSaveError(c, session.ID, err)
 		}
-		return c.Send(experienceQuestion)
+		return c.Send(strongZonesQuestion)
 
-	case db.QualificationStepExperience:
-		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepExperience, answer); err != nil {
+	case db.QualificationStepStrongZones:
+		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepStrongZones, answer); err != nil {
 			return h.qualificationSaveError(c, session.ID, err)
 		}
-		return c.Send(targetQuestion)
+		return c.Send(weakZonesQuestion)
 
-	case db.QualificationStepInterviewTarget:
-		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepInterviewTarget, answer); err != nil {
+	case db.QualificationStepWeakZones:
+		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepWeakZones, answer); err != nil {
 			return h.qualificationSaveError(c, session.ID, err)
 		}
-		session.InterviewTarget = answer
+		session.WeakZonesInput = answer
 		session.QualificationStep = db.QualificationStepDone
-		if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusAudit); err != nil {
-			h.logger.Error("advance phase", "error", err, "session_id", session.ID)
+		if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusProfileConfirmation); err != nil {
+			h.logger.Error("advance to profile confirmation", "error", err, "session_id", session.ID)
 			return c.Send(genericErrorMessage)
 		}
-		session.Status = db.SessionStatusAudit
-		return h.runAuditAndStartQuestion(ctx, c, student, session)
+		session.Status = db.SessionStatusProfileConfirmation
+		return c.Send(formatQualificationSummary(session), confirmationMenu)
 
 	case db.QualificationStepDone:
-		if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusAudit); err != nil {
-			h.logger.Error("advance completed qualification to audit", "error", err, "session_id", session.ID)
+		if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusProfileConfirmation); err != nil {
+			h.logger.Error("advance completed qualification to confirmation", "error", err, "session_id", session.ID)
 			return c.Send(genericErrorMessage)
 		}
-		session.Status = db.SessionStatusAudit
-		return h.runAuditAndStartQuestion(ctx, c, student, session)
+		session.Status = db.SessionStatusProfileConfirmation
+		return c.Send(formatQualificationSummary(session), confirmationMenu)
 
 	default:
 		h.logger.Error("unexpected qualification step", "step", session.QualificationStep, "session_id", session.ID)
@@ -755,6 +845,200 @@ func normalizeGrade(value string) (string, bool) {
 		return "сеньор", true
 	default:
 		return "", false
+	}
+}
+
+func gradeMenuForStep(step int) *tele.ReplyMarkup {
+	if step == db.QualificationStepTargetGrade {
+		return targetGradeMenu
+	}
+	return currentGradeMenu
+}
+
+func formatQualificationSummary(session *db.Session) string {
+	return fmt.Sprintf(`Зафиксировала твои ответы, правильно ли я понимаю, что...
+
+Текущий грейд: %s
+Целевой грейд: %s
+Сильные зоны: %s
+
+Получается, в первую очередь будем подтягивать %s для того, чтобы получить долгожданный оффер.
+Всё верно?`, session.CurrentGrade, session.Grade, session.StrongZones, session.WeakZonesInput)
+}
+
+func qualificationTopics(answer string) []string {
+	normalized := strings.ToLower(answer)
+	keywords := []struct {
+		phrase string
+		topic  string
+	}{
+		{"интеграции", "интеграции"},
+		{"базы данных", "бд"},
+		{"архитектура", "архитектура"},
+		{"требования", "требования"},
+		{"безопасность", "безопасность"},
+	}
+
+	var topics []string
+	for _, keyword := range keywords {
+		if strings.Contains(normalized, keyword.phrase) {
+			topics = append(topics, keyword.topic)
+		}
+	}
+	return topics
+}
+
+func sendPhoto(c tele.Context, path string) error {
+	return c.Send(&tele.Photo{File: tele.FromDisk(path)})
+}
+
+func (h *Handler) sendKDIRLesson(c tele.Context, sessionID int64) error {
+	if err := c.Send(kdirLessonMessage); err != nil {
+		return err
+	}
+	if err := sendPhoto(c, readyPhotoPath); err != nil {
+		h.logger.Error("send ready photo", "error", err, "session_id", sessionID)
+		return c.Send(genericErrorMessage)
+	}
+	return c.Send(readyPrompt, readyMenu)
+}
+
+func (h *Handler) handleConfirmProfileCallback(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		h.logger.Warn("respond callback", "error", err)
+	}
+
+	telegramID := senderID(c)
+	unlock := h.lockStudent(telegramID)
+	defer unlock()
+	ctx, cancel := newHandlerContext()
+	defer cancel()
+
+	student, err := h.repo.GetStudentByTelegramID(ctx, telegramID)
+	if errors.Is(err, db.ErrStudentNotFound) {
+		return c.Send("Похоже, ты еще не зарегистрирован. Напиши /start и код доступа, который тебе прислали.")
+	}
+	if err != nil {
+		h.logger.Error("get student", "error", err)
+		return c.Send(genericErrorMessage)
+	}
+	session, err := h.repo.GetActiveSession(ctx, student.TelegramID)
+	if err != nil {
+		h.logger.Error("get active session", "error", err)
+		return c.Send(genericErrorMessage)
+	}
+
+	if session.Status == db.SessionStatusKDIRLesson {
+		return h.sendKDIRLesson(c, session.ID)
+	}
+	if session.Status != db.SessionStatusProfileConfirmation {
+		return c.Send("Этот выбор уже сохранён. Продолжаем с текущего шага.")
+	}
+
+	topics := qualificationTopics(session.WeakZonesInput)
+	if err := h.repo.ConfirmQualification(ctx, session.ID, student.TelegramID, topics); err != nil {
+		h.logger.Error("confirm qualification", "error", err, "session_id", session.ID)
+		return c.Send(genericErrorMessage)
+	}
+	return h.sendKDIRLesson(c, session.ID)
+}
+
+func (h *Handler) handleEditProfileCallback(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		h.logger.Warn("respond callback", "error", err)
+	}
+
+	telegramID := senderID(c)
+	unlock := h.lockStudent(telegramID)
+	defer unlock()
+	ctx, cancel := newHandlerContext()
+	defer cancel()
+
+	student, err := h.repo.GetStudentByTelegramID(ctx, telegramID)
+	if err != nil {
+		h.logger.Error("get student for qualification edit", "error", err)
+		return c.Send(genericErrorMessage)
+	}
+	session, err := h.repo.GetActiveSession(ctx, student.TelegramID)
+	if err != nil {
+		h.logger.Error("get active session for qualification edit", "error", err)
+		return c.Send(genericErrorMessage)
+	}
+	if session.Status != db.SessionStatusProfileConfirmation {
+		return c.Send("Анкета уже подтверждена. Продолжаем с текущего шага.")
+	}
+	if err := h.repo.ResetQualification(ctx, session.ID); err != nil {
+		h.logger.Error("reset qualification", "error", err, "session_id", session.ID)
+		return c.Send(genericErrorMessage)
+	}
+	return c.Send(currentGradeQuestion, currentGradeMenu)
+}
+
+func (h *Handler) handleReadyCallback(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		h.logger.Warn("respond callback", "error", err)
+	}
+
+	telegramID := senderID(c)
+	unlock := h.lockStudent(telegramID)
+	defer unlock()
+	ctx, cancel := newHandlerContext()
+	defer cancel()
+
+	student, err := h.repo.GetStudentByTelegramID(ctx, telegramID)
+	if err != nil {
+		h.logger.Error("get student for KDIR ready", "error", err)
+		return c.Send(genericErrorMessage)
+	}
+	session, err := h.repo.GetActiveSession(ctx, student.TelegramID)
+	if err != nil {
+		h.logger.Error("get active session for KDIR ready", "error", err)
+		return c.Send(genericErrorMessage)
+	}
+	if session.Status != db.SessionStatusKDIRLesson {
+		return c.Send("Этот выбор уже сохранён. Продолжаем с текущего шага.")
+	}
+	if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusQuestionCycle); err != nil {
+		h.logger.Error("advance KDIR lesson to question cycle", "error", err, "session_id", session.ID)
+		return c.Send(genericErrorMessage)
+	}
+	session.Status = db.SessionStatusQuestionCycle
+	return h.askNextQuestion(ctx, c, student, session)
+}
+
+func (h *Handler) resumeCurrentStep(ctx context.Context, c tele.Context, session *db.Session) error {
+	switch session.Status {
+	case db.SessionStatusInstruction:
+		if err := sendPhoto(c, welcomePhotoPath); err != nil {
+			return err
+		}
+		if err := c.Send(instructionMessage); err != nil {
+			return err
+		}
+		if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusQualification); err != nil {
+			h.logger.Error("advance resumed instruction", "error", err, "session_id", session.ID)
+			return c.Send(genericErrorMessage)
+		}
+		return c.Send(currentGradeQuestion, currentGradeMenu)
+	case db.SessionStatusQualification:
+		switch session.QualificationStep {
+		case db.QualificationStepCurrentGrade:
+			return c.Send(currentGradeQuestion, currentGradeMenu)
+		case db.QualificationStepTargetGrade:
+			return c.Send(targetGradeQuestion, targetGradeMenu)
+		case db.QualificationStepStrongZones:
+			return c.Send(strongZonesQuestion)
+		case db.QualificationStepWeakZones:
+			return c.Send(weakZonesQuestion)
+		default:
+			return c.Send(formatQualificationSummary(session), confirmationMenu)
+		}
+	case db.SessionStatusProfileConfirmation:
+		return c.Send(formatQualificationSummary(session), confirmationMenu)
+	case db.SessionStatusKDIRLesson:
+		return h.sendKDIRLesson(c, session.ID)
+	default:
+		return c.Send("Хорошо, продолжаем с того места, где остановились. Пиши следующее сообщение.")
 	}
 }
 
@@ -809,7 +1093,7 @@ func (h *Handler) runAuditAndStartQuestion(ctx context.Context, c tele.Context, 
 }
 
 // handleQuestionCycle routes the incoming message using the durable attempt
-// status. One cycle consists of a primary answer, a follow-up answer and a
+// status. One block consists of a primary answer, two follow-up answers and a
 // vector choice before the next bank question.
 func (h *Handler) handleQuestionCycle(ctx context.Context, c tele.Context, student *db.Student, session *db.Session) error {
 	attempt, err := h.repo.GetActiveQuestionAttempt(ctx, session.ID)
@@ -833,6 +1117,10 @@ func (h *Handler) handleQuestionCycle(ctx context.Context, c tele.Context, stude
 		return h.deliverPrimaryFeedback(ctx, c, attempt)
 	case db.QuestionAttemptWaitingFollowup:
 		return h.evaluateFollowupAnswer(ctx, c, student, session, attempt)
+	case db.QuestionAttemptFollowupFeedbackReady:
+		return h.deliverFollowupFeedback(ctx, c, attempt)
+	case db.QuestionAttemptWaitingFollowup2:
+		return h.evaluateSecondFollowupAnswer(ctx, c, student, session, attempt)
 	case db.QuestionAttemptFinalFeedbackReady:
 		question, questionErr := h.repo.GetQuestionByID(ctx, attempt.QuestionID)
 		if questionErr != nil {
@@ -841,14 +1129,11 @@ func (h *Handler) handleQuestionCycle(ctx context.Context, c tele.Context, stude
 		}
 		return h.deliverFinalFeedback(ctx, c, student, session, attempt, question)
 	case db.QuestionAttemptWaitingVector:
-		if session.CycleCount >= h.sessionCycleLimit {
-			return h.finishSessionAfterLimit(ctx, c, student, session, attempt)
-		}
 		question, questionErr := h.repo.GetQuestionByID(ctx, attempt.QuestionID)
 		if questionErr != nil {
 			return c.Send("Выбери кнопкой, куда двигаться в следующем цикле.", vectorMenu)
 		}
-		return c.Send("Выбери кнопкой, куда двигаться в следующем цикле.", buildVectorMenu(session.WeakTopics, question.Topic))
+		return h.sendVectorChoice(c, session, question)
 	default:
 		h.logger.Error("unexpected question attempt status", "status", attempt.Status, "attempt_id", attempt.ID)
 		return c.Send(genericErrorMessage)
@@ -889,6 +1174,17 @@ func (h *Handler) askNextQuestion(ctx context.Context, c tele.Context, student *
 		// retry without it rather than dead-ending the cycle.
 		question, err = h.llm.PickQuestionForSession(ctx, session.ID, grade, "")
 	}
+	if errors.Is(err, db.ErrNoMatchingQuestion) {
+		if sendErr := c.Send("Подходящие вопросы в банке закончились. Завершаю тренировку и собираю итог."); sendErr != nil {
+			return sendErr
+		}
+		if advanceErr := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusSummary); advanceErr != nil {
+			h.logger.Error("advance exhausted question bank to summary", "error", advanceErr, "session_id", session.ID)
+			return c.Send(genericErrorMessage)
+		}
+		session.Status = db.SessionStatusSummary
+		return h.runSummary(ctx, c, student, session)
+	}
 	if err != nil {
 		h.logger.Error("pick question", "error", err, "grade", grade, "topic", topic, "session_id", session.ID)
 		return c.Send(genericErrorMessage)
@@ -901,7 +1197,29 @@ func (h *Handler) askNextQuestion(ctx context.Context, c tele.Context, student *
 	session.CurrentQuestionID = &question.ID
 	session.NextTopic = ""
 
-	return c.Send(question.QuestionText)
+	return c.Send(formatPrimaryQuestion(question, session.CycleCount == 0))
+}
+
+func formatPrimaryQuestion(question *db.QuestionBank, first bool) string {
+	lead := "Следующий вопрос, который может прилететь на собеседовании."
+	if first {
+		lead = "Отлично, первый вопрос, который может прилететь на собеседовании."
+	}
+	contextText := strings.TrimSpace(question.QuestionContext)
+	if contextText == "" {
+		contextText = "Представь, что это вопрос с технического собеседования системного аналитика."
+	}
+	return fmt.Sprintf("%s\n\n%s\n\n%s\n\nОтветь текстом по формуле КДИР. Я разберу ответ и сразу дам обратную связь.",
+		lead, contextText, strings.TrimSpace(question.QuestionText))
+}
+
+func formatFollowupQuestion(contextText, questionText string, number int) string {
+	contextText = strings.TrimSpace(contextText)
+	if contextText == "" {
+		contextText = "HR хочет проверить, как ты применишь ответ на практике."
+	}
+	return fmt.Sprintf("Теперь уточняющий вопрос %d из 2.\n\n%s\n\n%s\n\nОтвечай так же текстом по формуле КДИР.",
+		number, contextText, strings.TrimSpace(questionText))
 }
 
 // pickPriorityTopic returns the topic PickQuestion should prioritize.
@@ -955,7 +1273,12 @@ func (h *Handler) evaluatePrimaryAnswer(ctx context.Context, c tele.Context, stu
 		return c.Send(genericErrorMessage)
 	}
 
-	profile := llm.StudentProfile{Grade: session.Grade}
+	profile := llm.StudentProfile{
+		CurrentGrade: session.CurrentGrade,
+		TargetGrade:  session.Grade,
+		StrongZones:  session.StrongZones,
+		WeakZones:    session.WeakZonesInput,
+	}
 
 	reply, err := h.llm.Evaluate(ctx, profile, weakZones, answer, question)
 	if err != nil {
@@ -964,12 +1287,15 @@ func (h *Handler) evaluatePrimaryAnswer(ctx context.Context, c tele.Context, stu
 	}
 
 	followup := question.Followup1
+	followupContext := question.Followup1Context
 	if strings.TrimSpace(followup) == "" {
 		followup = question.Followup2
+		followupContext = question.Followup2Context
 	}
 	if strings.TrimSpace(followup) == "" {
 		followup = "Приведи конкретный пример и объясни, почему выбрал именно такой подход."
 	}
+	followup = formatFollowupQuestion(followupContext, followup, 1)
 
 	if err := h.repo.SavePrimaryFeedback(ctx, attempt.ID, answer, reply.Text, followup); err != nil {
 		h.logger.Error("save primary feedback", "error", err, "attempt_id", attempt.ID)
@@ -1012,13 +1338,79 @@ func (h *Handler) evaluateFollowupAnswer(ctx context.Context, c tele.Context, st
 		return c.Send(genericErrorMessage)
 	}
 
-	profile := llm.StudentProfile{Grade: session.Grade}
+	profile := llm.StudentProfile{
+		CurrentGrade: session.CurrentGrade,
+		TargetGrade:  session.Grade,
+		StrongZones:  session.StrongZones,
+		WeakZones:    session.WeakZonesInput,
+	}
 	reply, err := h.llm.EvaluateFollowup(
 		ctx, profile, weakZones, attempt.PrimaryAnswer,
 		attempt.FollowupQuestion, answer, question,
 	)
 	if err != nil {
 		h.logger.Error("llm evaluate followup answer", "error", err, "attempt_id", attempt.ID)
+		return c.Send(genericErrorMessage)
+	}
+
+	followup2 := strings.TrimSpace(question.Followup2)
+	if followup2 == "" {
+		followup2 = "Какой конкретный результат получился и как ты понял, что выбранный подход сработал?"
+	}
+	followup2 = formatFollowupQuestion(question.Followup2Context, followup2, 2)
+	if err := h.repo.SaveFollowupFeedback(ctx, attempt.ID, answer, reply.Text, followup2); err != nil {
+		h.logger.Error("save followup feedback", "error", err, "attempt_id", attempt.ID)
+		return c.Send(genericErrorMessage)
+	}
+	attempt.FollowupAnswer = answer
+	attempt.FollowupFeedback = reply.Text
+	attempt.Followup2Question = followup2
+	attempt.Status = db.QuestionAttemptFollowupFeedbackReady
+	return h.deliverFollowupFeedback(ctx, c, attempt)
+}
+
+func (h *Handler) deliverFollowupFeedback(ctx context.Context, c tele.Context, attempt *db.QuestionAttempt) error {
+	if err := sendText(c, attempt.FollowupFeedback); err != nil {
+		return err
+	}
+	if err := c.Send(attempt.Followup2Question); err != nil {
+		return err
+	}
+	if err := h.repo.MarkFollowupFeedbackDelivered(ctx, attempt.ID); err != nil {
+		h.logger.Error("mark followup feedback delivered", "error", err, "attempt_id", attempt.ID)
+		return c.Send(genericErrorMessage)
+	}
+	return nil
+}
+
+func (h *Handler) evaluateSecondFollowupAnswer(ctx context.Context, c tele.Context, student *db.Student, session *db.Session, attempt *db.QuestionAttempt) error {
+	answer, validationMessage := validateCandidateAnswer(c.Text())
+	if validationMessage != "" {
+		return c.Send(validationMessage)
+	}
+	question, err := h.repo.GetQuestionByID(ctx, attempt.QuestionID)
+	if err != nil {
+		h.logger.Error("get question for block evaluation", "error", err, "attempt_id", attempt.ID)
+		return c.Send(genericErrorMessage)
+	}
+	weakZones, err := h.repo.GetWeakZones(ctx, student.TelegramID)
+	if err != nil {
+		h.logger.Error("get weak zones", "error", err, "attempt_id", attempt.ID)
+		return c.Send(genericErrorMessage)
+	}
+	profile := llm.StudentProfile{
+		CurrentGrade: session.CurrentGrade,
+		TargetGrade:  session.Grade,
+		StrongZones:  session.StrongZones,
+		WeakZones:    session.WeakZonesInput,
+	}
+	reply, err := h.llm.EvaluateBlock(
+		ctx, profile, weakZones, attempt.PrimaryAnswer,
+		attempt.FollowupQuestion, attempt.FollowupAnswer,
+		attempt.Followup2Question, answer, question,
+	)
+	if err != nil {
+		h.logger.Error("llm evaluate complete block", "error", err, "attempt_id", attempt.ID)
 		return c.Send(genericErrorMessage)
 	}
 
@@ -1030,23 +1422,28 @@ func (h *Handler) evaluateFollowupAnswer(ctx context.Context, c tele.Context, st
 	if validTopics[strings.ToLower(question.Topic)] {
 		zoneTopic = strings.ToLower(question.Topic)
 	}
+	miniFeedback, fullFeedback := splitBlockFeedback(cleaned)
 
 	count, err := h.repo.FinalizeQuestionAttempt(
 		ctx, session.ID, student.TelegramID, attempt.ID,
-		answer, cleaned, zoneTopic, zoneStatus,
+		answer, miniFeedback, fullFeedback, zoneTopic, zoneStatus,
 	)
 	if err != nil {
 		h.logger.Error("finalize question attempt", "error", err, "session_id", session.ID, "attempt_id", attempt.ID)
 		return c.Send(genericErrorMessage)
 	}
-	attempt.FollowupAnswer = answer
-	attempt.FinalFeedback = cleaned
+	attempt.Followup2Answer = answer
+	attempt.Followup2Feedback = miniFeedback
+	attempt.FinalFeedback = fullFeedback
 	attempt.Status = db.QuestionAttemptFinalFeedbackReady
 	session.CycleCount = count
 	return h.deliverFinalFeedback(ctx, c, student, session, attempt, question)
 }
 
 func (h *Handler) deliverFinalFeedback(ctx context.Context, c tele.Context, student *db.Student, session *db.Session, attempt *db.QuestionAttempt, question *db.QuestionBank) error {
+	if err := sendText(c, attempt.Followup2Feedback); err != nil {
+		return err
+	}
 	if err := sendText(c, attempt.FinalFeedback); err != nil {
 		return err
 	}
@@ -1056,24 +1453,14 @@ func (h *Handler) deliverFinalFeedback(ctx context.Context, c tele.Context, stud
 	}
 	attempt.Status = db.QuestionAttemptWaitingVector
 
-	if session.CycleCount < h.sessionCycleLimit {
-		return c.Send("Куда двигаемся в следующем цикле?", buildVectorMenu(session.WeakTopics, question.Topic))
-	}
-
-	return h.finishSessionAfterLimit(ctx, c, student, session, attempt)
+	return h.sendVectorChoice(c, session, question)
 }
 
-func (h *Handler) finishSessionAfterLimit(ctx context.Context, c tele.Context, student *db.Student, session *db.Session, attempt *db.QuestionAttempt) error {
-	if err := h.repo.CompleteQuestionAttempt(ctx, session.ID, attempt.ID, "session_limit", ""); err != nil {
-		h.logger.Error("complete final question attempt", "error", err, "attempt_id", attempt.ID)
-		return c.Send(genericErrorMessage)
+func (h *Handler) sendVectorChoice(c tele.Context, session *db.Session, question *db.QuestionBank) error {
+	if h.sessionCycleLimit > 0 && session.CycleCount > 0 && session.CycleCount%h.sessionCycleLimit == 0 {
+		return c.Send("Хочешь продолжить тренировку?", buildCheckpointMenu())
 	}
-	if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusSummary); err != nil {
-		h.logger.Error("advance phase", "error", err, "session_id", session.ID)
-		return c.Send(genericErrorMessage)
-	}
-	session.Status = db.SessionStatusSummary
-	return h.runSummary(ctx, c, student, session)
+	return c.Send("Куда двигаемся в следующем блоке?", buildVectorMenu(session.WeakTopics, question.Topic))
 }
 
 func (h *Handler) handleVectorCallback(c tele.Context) error {
@@ -1099,9 +1486,6 @@ func (h *Handler) handleVectorCallback(c tele.Context) error {
 	if err != nil || attempt.Status != db.QuestionAttemptWaitingVector {
 		return c.Send("Этот выбор уже неактуален. Продолжаем с текущего шага.")
 	}
-	if session.CycleCount >= h.sessionCycleLimit {
-		return h.finishSessionAfterLimit(ctx, c, student, session, attempt)
-	}
 	question, err := h.repo.GetQuestionByID(ctx, attempt.QuestionID)
 	if err != nil {
 		h.logger.Error("get question for vector", "error", err, "attempt_id", attempt.ID)
@@ -1112,6 +1496,19 @@ func (h *Handler) handleVectorCallback(c tele.Context) error {
 	var nextTopic string
 	parts := strings.Split(selectedVector, "|")
 	switch parts[0] {
+	case "finish":
+		if err := h.repo.CompleteQuestionAttempt(ctx, session.ID, attempt.ID, selectedVector, ""); err != nil {
+			h.logger.Error("complete question attempt before summary", "error", err, "attempt_id", attempt.ID)
+			return c.Send(genericErrorMessage)
+		}
+		if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusSummary); err != nil {
+			h.logger.Error("advance phase", "error", err, "session_id", session.ID)
+			return c.Send(genericErrorMessage)
+		}
+		session.Status = db.SessionStatusSummary
+		return h.runSummary(ctx, c, student, session)
+	case "continue":
+		nextTopic = "*"
 	case "topic":
 		if len(parts) != 2 || !validTopics[strings.ToLower(parts[1])] {
 			return c.Send("Выбери один из предложенных вариантов.", vectorMenu)
@@ -1153,7 +1550,17 @@ func buildVectorMenu(weakTopics, currentTopic string) *tele.ReplyMarkup {
 	}
 	random := menu.Data("Случайная тема", "question_vector", "random")
 	rows = append(rows, menu.Row(random))
+	finish := menu.Data("Завершить тренировку", "question_vector", "finish")
+	rows = append(rows, menu.Row(finish))
 	menu.Inline(rows...)
+	return menu
+}
+
+func buildCheckpointMenu() *tele.ReplyMarkup {
+	menu := &tele.ReplyMarkup{}
+	continueButton := menu.Data("Продолжить", "question_vector", "continue")
+	finishButton := menu.Data("Завершить тренировку", "question_vector", "finish")
+	menu.Inline(menu.Row(continueButton), menu.Row(finishButton))
 	return menu
 }
 
@@ -1191,8 +1598,10 @@ func (h *Handler) runSummary(ctx context.Context, c tele.Context, student *db.St
 	}
 
 	profile := llm.QualificationProfile{
-		Grade: session.Grade, Direction: session.Direction,
-		Experience: session.Experience, InterviewTarget: session.InterviewTarget,
+		CurrentGrade: session.CurrentGrade,
+		TargetGrade:  session.Grade,
+		StrongZones:  session.StrongZones,
+		WeakZones:    session.WeakZonesInput,
 	}
 	attempts, err := h.repo.GetSessionAttemptReports(ctx, session.ID)
 	if err != nil {
@@ -1357,7 +1766,7 @@ func extractWeakTopics(text string) (topics []string, cleaned string) {
 }
 
 // extractWeakZoneStatus strips the technical status emitted after the full
-// two-answer evaluation.
+// three-answer block evaluation.
 func extractWeakZoneStatus(text string) (status, cleaned string) {
 	cleaned = text
 	m := weakZoneStatusMarkerRE.FindStringSubmatch(text)
@@ -1367,6 +1776,24 @@ func extractWeakZoneStatus(text string) (status, cleaned string) {
 	status = strings.ToLower(strings.TrimSpace(m[1]))
 	cleaned = strings.TrimSpace(strings.Replace(cleaned, m[0], "", 1))
 	return status, cleaned
+}
+
+// splitBlockFeedback separates the third answer's immediate mini-feedback
+// from the full KDIR review so Telegram receives them as two distinct frames.
+// If the model misses the requested heading, keep its useful response visible
+// and add an explicit fallback instead of dropping either required message.
+func splitBlockFeedback(text string) (mini, full string) {
+	text = strings.TrimSpace(text)
+	loc := bigFeedbackHeadingRE.FindStringIndex(text)
+	if loc == nil {
+		return text, "▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ\nМодель не разделила мини-разбор и общий разбор блока. Ответ выше сохранён целиком; попробуй следующий блок."
+	}
+	mini = strings.TrimSpace(text[:loc[0]])
+	full = strings.TrimSpace(text[loc[0]:])
+	if mini == "" {
+		mini = "▸ ОБРАТНАЯ СВЯЗЬ\nОтвет принят и учтён в общем разборе блока."
+	}
+	return mini, full
 }
 
 // sendText splits long model output below Telegram's message limit. Optional

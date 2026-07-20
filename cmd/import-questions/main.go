@@ -21,10 +21,13 @@ import (
 // question_bank columns. Their order in the file does not matter.
 var requiredColumns = []string{
 	"question_text",
+	"question_context",
 	"grade",
 	"topic",
 	"followup_1",
+	"followup_1_context",
 	"followup_2",
+	"followup_2_context",
 	"answer_junior",
 	"answer_middle",
 	"answer_senior",
@@ -117,22 +120,30 @@ func run() error {
 
 		_, err = tx.Exec(ctx,
 			`INSERT INTO question_bank
-			 (question_text, grade, topic, followup_1, followup_2, answer_junior, answer_middle, answer_senior, source)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			 (question_text, question_context, grade, topic,
+			  followup_1, followup_1_context, followup_2, followup_2_context,
+			  answer_junior, answer_middle, answer_senior, source)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			 ON CONFLICT (question_text) DO UPDATE SET
+			     question_context = EXCLUDED.question_context,
 			     grade = EXCLUDED.grade,
 			     topic = EXCLUDED.topic,
 			     followup_1 = EXCLUDED.followup_1,
+			     followup_1_context = EXCLUDED.followup_1_context,
 			     followup_2 = EXCLUDED.followup_2,
+			     followup_2_context = EXCLUDED.followup_2_context,
 			     answer_junior = EXCLUDED.answer_junior,
 			     answer_middle = EXCLUDED.answer_middle,
 			     answer_senior = EXCLUDED.answer_senior,
 			     source = EXCLUDED.source`,
 			row[colIndex["question_text"]],
+			row[colIndex["question_context"]],
 			row[colIndex["grade"]],
 			row[colIndex["topic"]],
 			row[colIndex["followup_1"]],
+			row[colIndex["followup_1_context"]],
 			row[colIndex["followup_2"]],
+			row[colIndex["followup_2_context"]],
 			row[colIndex["answer_junior"]],
 			row[colIndex["answer_middle"]],
 			row[colIndex["answer_senior"]],
@@ -164,7 +175,8 @@ func normalizeQuestionRow(row []string, columns map[string]int) []string {
 
 func validateQuestionRow(row []string, columns map[string]int) error {
 	requiredText := []string{
-		"question_text", "followup_1", "followup_2",
+		"question_text", "question_context", "followup_1", "followup_1_context",
+		"followup_2", "followup_2_context",
 		"answer_junior", "answer_middle", "answer_senior",
 	}
 	for _, column := range requiredText {

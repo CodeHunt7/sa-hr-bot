@@ -22,6 +22,7 @@ RUN apk add --no-cache ca-certificates \
 
 COPY --from=build /out/bot /usr/local/bin/bot
 COPY prompts /app/prompts
+COPY media /app/media
 
 WORKDIR /app
 USER app

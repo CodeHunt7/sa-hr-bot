@@ -39,6 +39,7 @@ type fakeContext struct {
 	data   string
 
 	sent         []string
+	sentPhotos   []*tele.Photo
 	sentDocs     []*tele.Document
 	sentDocBytes [][]byte
 	responded    bool
@@ -53,6 +54,8 @@ func (f *fakeContext) Send(what interface{}, _ ...interface{}) error {
 	switch v := what.(type) {
 	case string:
 		f.sent = append(f.sent, v)
+	case *tele.Photo:
+		f.sentPhotos = append(f.sentPhotos, v)
 	case *tele.Document:
 		f.sentDocs = append(f.sentDocs, v)
 		// Read the file now: handleReport removes it (defer os.Remove)
@@ -221,18 +224,48 @@ func (r *fakeRepo) SetQualificationAnswer(_ context.Context, sessionID int64, st
 		return errors.New("unexpected qualification step")
 	}
 	switch step {
-	case db.QualificationStepGrade:
+	case db.QualificationStepCurrentGrade:
+		s.CurrentGrade = answer
+	case db.QualificationStepTargetGrade:
 		s.Grade = answer
-	case db.QualificationStepDirection:
-		s.Direction = answer
-	case db.QualificationStepExperience:
-		s.Experience = answer
-	case db.QualificationStepInterviewTarget:
-		s.InterviewTarget = answer
+	case db.QualificationStepStrongZones:
+		s.StrongZones = answer
+	case db.QualificationStepWeakZones:
+		s.WeakZonesInput = answer
 	default:
 		return errors.New("invalid qualification step")
 	}
 	s.QualificationStep++
+	return nil
+}
+
+func (r *fakeRepo) ResetQualification(_ context.Context, sessionID int64) error {
+	r.maybePanic()
+	s, ok := r.sessions[sessionID]
+	if !ok || s.Status != db.SessionStatusProfileConfirmation {
+		return errors.New("session is not waiting for confirmation")
+	}
+	s.Status = db.SessionStatusQualification
+	s.QualificationStep = db.QualificationStepCurrentGrade
+	s.CurrentGrade = ""
+	s.Grade = ""
+	s.StrongZones = ""
+	s.WeakZonesInput = ""
+	s.WeakTopics = ""
+	return nil
+}
+
+func (r *fakeRepo) ConfirmQualification(_ context.Context, sessionID, studentID int64, topics []string) error {
+	r.maybePanic()
+	s, ok := r.sessions[sessionID]
+	if !ok || s.Status != db.SessionStatusProfileConfirmation || s.QualificationStep != db.QualificationStepDone {
+		return errors.New("session is not waiting for confirmation")
+	}
+	s.Status = db.SessionStatusKDIRLesson
+	s.WeakTopics = strings.Join(topics, ",")
+	for _, topic := range topics {
+		_, _ = r.SaveWeakZone(context.Background(), studentID, topic, db.WeakZoneStatusHypothesis)
+	}
 	return nil
 }
 
@@ -331,18 +364,43 @@ func (r *fakeRepo) MarkPrimaryFeedbackDelivered(_ context.Context, attemptID int
 	return nil
 }
 
-func (r *fakeRepo) FinalizeQuestionAttempt(_ context.Context, sessionID, studentID, attemptID int64, answer, feedback, zoneTopic, zoneStatus string) (int, error) {
+func (r *fakeRepo) SaveFollowupFeedback(_ context.Context, attemptID int64, answer, feedback, followup2Question string) error {
 	r.maybePanic()
 	attempt, ok := r.attempts[attemptID]
 	if !ok || attempt.Status != db.QuestionAttemptWaitingFollowup {
-		return 0, errors.New("attempt is not waiting for followup")
+		return errors.New("attempt is not waiting for followup")
+	}
+	attempt.FollowupAnswer = answer
+	attempt.FollowupFeedback = feedback
+	attempt.Followup2Question = followup2Question
+	attempt.Status = db.QuestionAttemptFollowupFeedbackReady
+	attempt.UpdatedAt = time.Now()
+	return nil
+}
+
+func (r *fakeRepo) MarkFollowupFeedbackDelivered(_ context.Context, attemptID int64) error {
+	r.maybePanic()
+	attempt, ok := r.attempts[attemptID]
+	if !ok || attempt.Status != db.QuestionAttemptFollowupFeedbackReady {
+		return errors.New("followup feedback is not ready")
+	}
+	attempt.Status = db.QuestionAttemptWaitingFollowup2
+	return nil
+}
+
+func (r *fakeRepo) FinalizeQuestionAttempt(_ context.Context, sessionID, studentID, attemptID int64, answer, miniFeedback, fullFeedback, zoneTopic, zoneStatus string) (int, error) {
+	r.maybePanic()
+	attempt, ok := r.attempts[attemptID]
+	if !ok || attempt.Status != db.QuestionAttemptWaitingFollowup2 {
+		return 0, errors.New("attempt is not waiting for followup 2")
 	}
 	session, ok := r.sessions[sessionID]
 	if !ok {
 		return 0, errors.New("session not found")
 	}
-	attempt.FollowupAnswer = answer
-	attempt.FinalFeedback = feedback
+	attempt.Followup2Answer = answer
+	attempt.Followup2Feedback = miniFeedback
+	attempt.FinalFeedback = fullFeedback
 	attempt.Status = db.QuestionAttemptFinalFeedbackReady
 	attempt.UpdatedAt = time.Now()
 	if zoneTopic != "" {
@@ -391,7 +449,8 @@ func (r *fakeRepo) GetSessionAttemptReports(_ context.Context, sessionID int64) 
 		result = append(result, db.QuestionAttemptReport{
 			QuestionText: question.QuestionText, Topic: question.Topic,
 			PrimaryAnswer: attempt.PrimaryAnswer, FollowupQuestion: attempt.FollowupQuestion,
-			FollowupAnswer: attempt.FollowupAnswer, FinalFeedback: attempt.FinalFeedback,
+			FollowupAnswer: attempt.FollowupAnswer, Followup2Question: attempt.Followup2Question,
+			Followup2Answer: attempt.Followup2Answer, FinalFeedback: attempt.FinalFeedback,
 		})
 	}
 	return result, nil
@@ -456,6 +515,7 @@ type fakeLLM struct {
 	replyCalls        int
 	evalCalls         int
 	followupEvalCalls int
+	blockEvalCalls    int
 	pickErr           error // if set, returned by the next PickQuestion call, then cleared
 
 	lastEvalQuestion             *db.QuestionBank
@@ -520,6 +580,12 @@ func (f *fakeLLM) EvaluateFollowup(_ context.Context, _ llm.StudentProfile, _ []
 	return f.nextReply(), nil
 }
 
+func (f *fakeLLM) EvaluateBlock(_ context.Context, _ llm.StudentProfile, _ []db.WeakZone, _, _, _, _, _ string, question *db.QuestionBank) (*llm.Reply, error) {
+	f.blockEvalCalls++
+	f.lastEvalQuestion = question
+	return f.nextReply(), nil
+}
+
 func (f *fakeLLM) PickQuestion(_ context.Context, grade, topic string) (*db.QuestionBank, error) {
 	f.pickCalls++
 	f.lastPickGrade, f.lastPickTopic = grade, topic
@@ -539,7 +605,7 @@ func TestFullSessionFlow(t *testing.T) {
 	repo := newFakeRepo("SA2026-TEST")
 	question := &db.QuestionBank{
 		ID: 1, QuestionText: "q", Grade: "мидл", Topic: "бд",
-		Followup1:    "follow-up q",
+		Followup1: "follow-up q", Followup2: "follow-up q2",
 		AnswerJunior: "junior answer", AnswerMiddle: "middle answer", AnswerSenior: "senior answer",
 	}
 	repo.questions[question.ID] = question
@@ -562,13 +628,17 @@ func TestFullSessionFlow(t *testing.T) {
 		t.Fatalf("student should not exist after an invalid code")
 	}
 
-	// Valid code: registers, sends the fixed instruction and grade question,
-	// then lands in deterministic QUALIFICATION without calling the model.
+	// Valid code: registers, sends the welcome photo, fixed instruction and
+	// current-grade question, then lands in deterministic QUALIFICATION without
+	// calling the model.
 	startCtx := newCtx(telegramID, "/start SA2026-TEST", "SA2026-TEST")
 	if err := h.handleStart(startCtx); err != nil {
 		t.Fatalf("handleStart: %v", err)
 	}
-	if len(startCtx.sent) != 2 || startCtx.sent[0] != instructionMessage || startCtx.sent[1] != gradeQuestion {
+	if len(startCtx.sentPhotos) != 1 || startCtx.sentPhotos[0].FileLocal != welcomePhotoPath {
+		t.Fatalf("expected welcome photo, got %+v", startCtx.sentPhotos)
+	}
+	if len(startCtx.sent) != 2 || startCtx.sent[0] != instructionMessage || startCtx.sent[1] != currentGradeQuestion {
 		t.Fatalf("unexpected initial messages: %v", startCtx.sent)
 	}
 	session, err := repo.GetActiveSession(ctx, telegramID)
@@ -579,71 +649,87 @@ func TestFullSessionFlow(t *testing.T) {
 		t.Fatalf("expected QUALIFICATION after instruction, got %s", session.Status)
 	}
 
-	// Grade is chosen explicitly, then the remaining answers are stored
-	// verbatim one by one. No reply markers or model calls are involved.
-	gradeCtx := newCtx(telegramID, "")
-	gradeCtx.data = "мидл"
-	if err := h.handleGradeCallback(gradeCtx); err != nil {
-		t.Fatalf("handleGradeCallback: %v", err)
+	// Current and target grades are chosen explicitly, then strong and weak
+	// zones are stored verbatim. No reply markers or model calls are involved.
+	currentGradeCtx := newCtx(telegramID, "")
+	currentGradeCtx.data = "джун"
+	if err := h.handleGradeCallback(currentGradeCtx); err != nil {
+		t.Fatalf("handle current grade callback: %v", err)
 	}
-	if len(gradeCtx.sent) != 1 || gradeCtx.sent[0] != directionQuestion {
-		t.Fatalf("expected direction question, got %v", gradeCtx.sent)
-	}
-
-	directionCtx := newCtx(telegramID, "Финтех и банковские продукты")
-	if err := h.handleMessage(directionCtx); err != nil {
-		t.Fatalf("direction answer: %v", err)
-	}
-	if len(directionCtx.sent) != 1 || directionCtx.sent[0] != experienceQuestion {
-		t.Fatalf("expected experience question, got %v", directionCtx.sent)
+	if len(currentGradeCtx.sent) != 1 || currentGradeCtx.sent[0] != targetGradeQuestion {
+		t.Fatalf("expected target grade question, got %v", currentGradeCtx.sent)
 	}
 
-	experienceCtx := newCtx(telegramID, "Есть требования и UML, почти нет Kafka и сложных интеграций")
-	if err := h.handleMessage(experienceCtx); err != nil {
-		t.Fatalf("experience answer: %v", err)
+	targetGradeCtx := newCtx(telegramID, "")
+	targetGradeCtx.data = "мидл"
+	if err := h.handleGradeCallback(targetGradeCtx); err != nil {
+		t.Fatalf("handle target grade callback: %v", err)
 	}
-	if len(experienceCtx.sent) != 1 || experienceCtx.sent[0] != targetQuestion {
-		t.Fatalf("expected interview target question, got %v", experienceCtx.sent)
+	if len(targetGradeCtx.sent) != 1 || targetGradeCtx.sent[0] != strongZonesQuestion {
+		t.Fatalf("expected strong zones question, got %v", targetGradeCtx.sent)
+	}
+
+	strongCtx := newCtx(telegramID, "Требования и архитектура")
+	if err := h.handleMessage(strongCtx); err != nil {
+		t.Fatalf("strong zones answer: %v", err)
+	}
+	if len(strongCtx.sent) != 1 || strongCtx.sent[0] != weakZonesQuestion {
+		t.Fatalf("expected weak zones question, got %v", strongCtx.sent)
 	}
 
 	session, _ = repo.GetActiveSession(ctx, telegramID)
-	if session.Status != db.SessionStatusQualification || session.QualificationStep != db.QualificationStepInterviewTarget {
-		t.Fatalf("expected QUALIFICATION at interview target step, got status=%s step=%d", session.Status, session.QualificationStep)
+	if session.Status != db.SessionStatusQualification || session.QualificationStep != db.QualificationStepWeakZones {
+		t.Fatalf("expected QUALIFICATION at weak zones step, got status=%s step=%d", session.Status, session.QualificationStep)
 	}
-	if session.Grade != "мидл" || session.Direction == "" || session.Experience == "" {
+	if session.CurrentGrade != "джун" || session.Grade != "мидл" || session.StrongZones == "" {
 		t.Fatalf("expected first 3 qualification answers captured, got %+v", session)
 	}
 
-	// The fourth answer immediately triggers audit and the first bank
-	// question. No extra "готов" message is required between phases.
-	lm.replies = []string{"▸ МИНИ-АУДИТ\nВероятно, слабое место: интеграции. Проверим на практике.\nWEAK_TOPICS: интеграции,бд"}
-	qualDoneCtx := newCtx(telegramID, "Собеседование в пятницу")
+	// The fourth answer shows a deterministic profile confirmation. The old
+	// LLM mini-audit is not called.
+	qualDoneCtx := newCtx(telegramID, "Интеграции и Базы данных")
 	if err := h.handleMessage(qualDoneCtx); err != nil {
-		t.Fatalf("interview target answer: %v", err)
+		t.Fatalf("weak zones answer: %v", err)
 	}
-	if len(qualDoneCtx.sent) != 2 {
-		t.Fatalf("expected audit and first question, got %v", qualDoneCtx.sent)
+	if len(qualDoneCtx.sent) != 1 || !strings.Contains(qualDoneCtx.sent[0], "Текущий грейд: джун") ||
+		!strings.Contains(qualDoneCtx.sent[0], "Интеграции и Базы данных") {
+		t.Fatalf("expected profile confirmation, got %v", qualDoneCtx.sent)
 	}
-	if !strings.Contains(qualDoneCtx.sent[0], "МИНИ-АУДИТ") || strings.Contains(qualDoneCtx.sent[0], "WEAK_TOPICS") {
-		t.Fatalf("expected cleaned mini-audit, got %q", qualDoneCtx.sent[0])
+	session, _ = repo.GetActiveSession(ctx, telegramID)
+	if session.Status != db.SessionStatusProfileConfirmation || session.QualificationStep != db.QualificationStepDone {
+		t.Fatalf("expected profile confirmation state, got %+v", session)
 	}
-	if qualDoneCtx.sent[1] != "q" {
-		t.Fatalf("expected first bank question immediately after audit, got %q", qualDoneCtx.sent[1])
+	if lm.replyCalls != 0 || lm.pickCalls != 0 {
+		t.Fatalf("qualification and confirmation must not call LLM or pick a question, reply=%d pick=%d", lm.replyCalls, lm.pickCalls)
+	}
+
+	confirmCtx := newCtx(telegramID, "")
+	confirmCtx.data = "confirm"
+	if err := h.handleConfirmProfileCallback(confirmCtx); err != nil {
+		t.Fatalf("confirm profile: %v", err)
+	}
+	if len(confirmCtx.sent) != 2 || confirmCtx.sent[0] != kdirLessonMessage || confirmCtx.sent[1] != readyPrompt {
+		t.Fatalf("expected KDIR lesson and ready prompt, got %v", confirmCtx.sent)
+	}
+	if len(confirmCtx.sentPhotos) != 1 || confirmCtx.sentPhotos[0].FileLocal != readyPhotoPath {
+		t.Fatalf("expected ready photo, got %+v", confirmCtx.sentPhotos)
+	}
+	session, _ = repo.GetActiveSession(ctx, telegramID)
+	if session.Status != db.SessionStatusKDIRLesson || session.WeakTopics != "интеграции,бд" {
+		t.Fatalf("expected KDIR lesson with deterministic topics, got %+v", session)
+	}
+
+	readyCtx := newCtx(telegramID, "")
+	readyCtx.data = "ready"
+	if err := h.handleReadyCallback(readyCtx); err != nil {
+		t.Fatalf("ready callback: %v", err)
+	}
+	if len(readyCtx.sent) != 1 || !strings.Contains(readyCtx.sent[0], "q") || !strings.Contains(readyCtx.sent[0], "КДИР") {
+		t.Fatalf("expected first question after ready, got %v", readyCtx.sent)
 	}
 	session, _ = repo.GetActiveSession(ctx, telegramID)
 	if session.Status != db.SessionStatusQuestionCycle {
-		t.Fatalf("expected QUESTION_CYCLE after automatic audit, got %s", session.Status)
-	}
-	if session.QualificationStep != db.QualificationStepDone || session.InterviewTarget != "Собеседование в пятницу" {
-		t.Fatalf("expected all qualification answers captured, got %+v", session)
-	}
-	if session.WeakTopics != "интеграции,бд" {
-		t.Fatalf("expected audit topics stored, got %q", session.WeakTopics)
-	}
-	for _, want := range []string{"мидл", "Финтех и банковские продукты", "Есть требования и UML", "Собеседование в пятницу"} {
-		if !strings.Contains(lm.lastReplyContext, want) {
-			t.Fatalf("audit context must contain %q, got:\n%s", want, lm.lastReplyContext)
-		}
+		t.Fatalf("expected QUESTION_CYCLE after ready, got %s", session.Status)
 	}
 	if session.CurrentQuestionID == nil || *session.CurrentQuestionID != 1 {
 		t.Fatalf("expected current_question_id=1, got %v", session.CurrentQuestionID)
@@ -671,7 +757,7 @@ func TestFullSessionFlow(t *testing.T) {
 	if !strings.Contains(answerCtx.sent[0], "ОБРАТНАЯ СВЯЗЬ") {
 		t.Fatalf("expected the evaluation frame first, got %q", answerCtx.sent[0])
 	}
-	if answerCtx.sent[1] != "follow-up q" {
+	if !strings.Contains(answerCtx.sent[1], "follow-up q") || !strings.Contains(answerCtx.sent[1], "уточняющий вопрос 1") {
 		t.Fatalf("expected the follow-up second, got %q", answerCtx.sent[1])
 	}
 	if lm.lastEvalQuestion == nil || lm.lastEvalQuestion.ID != 1 || lm.lastEvalQuestion.AnswerSenior != "senior answer" {
@@ -689,18 +775,37 @@ func TestFullSessionFlow(t *testing.T) {
 		t.Fatalf("expected 1 primary evaluation and still 1 picked question, got eval=%d pick=%d", lm.evalCalls, lm.pickCalls)
 	}
 
-	// Follow-up answer completes the first cycle and waits for a vector.
-	lm.replies = []string{"▸ ОБРАТНАЯ СВЯЗЬ\nПробел остался\n\n▸ ПОЛНАЯ ОБРАТНАЯ СВЯЗЬ\n...\nWEAK_ZONE_STATUS: confirmed"}
+	// The first follow-up gets mini-feedback and the second bank follow-up.
+	lm.replies = []string{"▸ ОБРАТНАЯ СВЯЗЬ\nПервое уточнение разобрано"}
 	followupCtx := newCtx(telegramID, "мой ответ на уточнение 1")
 	if err := h.handleMessage(followupCtx); err != nil {
 		t.Fatalf("handleMessage follow-up answer 1: %v", err)
 	}
-	if len(followupCtx.sent) != 2 || strings.Contains(followupCtx.sent[0], "WEAK_ZONE_STATUS") {
-		t.Fatalf("expected cleaned full feedback and vector prompt, got %v", followupCtx.sent)
+	if len(followupCtx.sent) != 2 || !strings.Contains(followupCtx.sent[1], "follow-up q2") || !strings.Contains(followupCtx.sent[1], "уточняющий вопрос 2") {
+		t.Fatalf("expected mini-feedback and second follow-up, got %v", followupCtx.sent)
+	}
+	session, _ = repo.GetActiveSession(ctx, telegramID)
+	if session.CycleCount != 0 {
+		t.Fatalf("block must not count before third answer, got %d", session.CycleCount)
+	}
+	attempt, _ = repo.GetActiveQuestionAttempt(ctx, session.ID)
+	if attempt.Status != db.QuestionAttemptWaitingFollowup2 {
+		t.Fatalf("expected second follow-up state, got %s", attempt.Status)
+	}
+
+	// The third answer receives its own mini-feedback, then the large KDIR
+	// review. Only now does the completed-block count increase.
+	lm.replies = []string{"▸ ОБРАТНАЯ СВЯЗЬ\nПробел остался\n\n▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ\nКДИР-разбор\nWEAK_ZONE_STATUS: confirmed"}
+	secondFollowupCtx := newCtx(telegramID, "мой ответ на второе уточнение 1")
+	if err := h.handleMessage(secondFollowupCtx); err != nil {
+		t.Fatalf("handleMessage second follow-up answer 1: %v", err)
+	}
+	if len(secondFollowupCtx.sent) != 3 || strings.Contains(strings.Join(secondFollowupCtx.sent, "\n"), "WEAK_ZONE_STATUS") {
+		t.Fatalf("expected third mini-feedback, big feedback and vector prompt, got %v", secondFollowupCtx.sent)
 	}
 	session, _ = repo.GetActiveSession(ctx, telegramID)
 	if session.CycleCount != 1 {
-		t.Fatalf("expected one completed cycle, got %d", session.CycleCount)
+		t.Fatalf("expected one completed block, got %d", session.CycleCount)
 	}
 	attempt, _ = repo.GetActiveQuestionAttempt(ctx, session.ID)
 	if attempt.Status != db.QuestionAttemptWaitingVector {
@@ -722,7 +827,7 @@ func TestFullSessionFlow(t *testing.T) {
 	if err := h.handleVectorCallback(vectorCtx); err != nil {
 		t.Fatalf("handleVectorCallback: %v", err)
 	}
-	if len(vectorCtx.sent) != 1 || vectorCtx.sent[0] != "q" {
+	if len(vectorCtx.sent) != 1 || !strings.Contains(vectorCtx.sent[0], "q") {
 		t.Fatalf("expected question 2 after vector choice, got %v", vectorCtx.sent)
 	}
 
@@ -731,18 +836,29 @@ func TestFullSessionFlow(t *testing.T) {
 		t.Fatalf("handleMessage primary answer 2: %v", err)
 	}
 
-	// The second follow-up reaches the cycle limit and produces a summary from
-	// both persisted attempts.
-	lm.replies = []string{
-		"▸ ОБРАТНАЯ СВЯЗЬ\nПробел закрыт\n\n▸ ПОЛНАЯ ОБРАТНАЯ СВЯЗЬ\n...\nWEAK_ZONE_STATUS: closed",
-		"Итоговый отчет",
+	lm.replies = []string{"▸ ОБРАТНАЯ СВЯЗЬ\nРазбор первого уточнения 2"}
+	if err := h.handleMessage(newCtx(telegramID, "мой ответ на уточнение 2")); err != nil {
+		t.Fatalf("handleMessage first follow-up in block 2: %v", err)
 	}
-	finalCtx := newCtx(telegramID, "мой ответ на уточнение 2")
+
+	// At the configured limit the bot asks rather than ending automatically.
+	lm.replies = []string{"▸ ОБРАТНАЯ СВЯЗЬ\nПробел закрыт\n\n▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ\nКДИР-разбор 2\nWEAK_ZONE_STATUS: closed"}
+	finalCtx := newCtx(telegramID, "мой ответ на второе уточнение 2")
 	if err := h.handleMessage(finalCtx); err != nil {
-		t.Fatalf("handleMessage follow-up answer 2: %v", err)
+		t.Fatalf("handleMessage second follow-up in block 2: %v", err)
 	}
-	if len(finalCtx.sent) != 2 || finalCtx.sent[1] != "Итоговый отчет" {
-		t.Fatalf("expected final feedback and summary, got %v", finalCtx.sent)
+	if len(finalCtx.sent) != 3 || finalCtx.sent[2] != "Хочешь продолжить тренировку?" {
+		t.Fatalf("expected feedback and soft-limit choice, got %v", finalCtx.sent)
+	}
+
+	lm.replies = []string{"Итоговый отчет"}
+	finishCtx := newCtx(telegramID, "")
+	finishCtx.data = "finish"
+	if err := h.handleVectorCallback(finishCtx); err != nil {
+		t.Fatalf("finish callback: %v", err)
+	}
+	if len(finishCtx.sent) != 1 || finishCtx.sent[0] != "Итоговый отчет" {
+		t.Fatalf("expected final summary, got %v", finishCtx.sent)
 	}
 
 	if _, err := repo.GetActiveSession(ctx, telegramID); !errors.Is(err, db.ErrNoActiveSession) {
@@ -751,8 +867,8 @@ func TestFullSessionFlow(t *testing.T) {
 	if len(repo.summaries) != 1 || repo.summaries[0].SummaryText != "Итоговый отчет" {
 		t.Fatalf("expected the summary to be saved, got %v", repo.summaries)
 	}
-	if lm.evalCalls != 2 || lm.followupEvalCalls != 2 {
-		t.Fatalf("expected 2 primary and 2 follow-up evaluations, got primary=%d followup=%d", lm.evalCalls, lm.followupEvalCalls)
+	if lm.evalCalls != 2 || lm.followupEvalCalls != 2 || lm.blockEvalCalls != 2 {
+		t.Fatalf("expected two evaluations at every answer position, got primary=%d followup=%d block=%d", lm.evalCalls, lm.followupEvalCalls, lm.blockEvalCalls)
 	}
 	if lm.pickCalls != 2 {
 		t.Fatalf("expected exactly 2 picked primary questions, got %d", lm.pickCalls)
@@ -912,7 +1028,9 @@ func TestRestartCallback_ResetsAllSessionFields(t *testing.T) {
 	dirty.Direction = "старое направление"
 	dirty.Experience = "старый опыт"
 	dirty.InterviewTarget = "старая вакансия"
-	dirty.QualificationStep = db.QualificationStepInterviewTarget
+	dirty.StrongZones = "старые сильные зоны"
+	dirty.WeakZonesInput = "старые слабые зоны"
+	dirty.QualificationStep = db.QualificationStepWeakZones
 
 	lm.replies = []string{"новая инструкция"}
 	restartCtx := newCtx(telegramID, "")
@@ -955,7 +1073,11 @@ func TestRestartCallback_ResetsAllSessionFields(t *testing.T) {
 		t.Errorf("new qualification fields not reset: direction=%q experience=%q target=%q",
 			fresh.Direction, fresh.Experience, fresh.InterviewTarget)
 	}
-	if fresh.QualificationStep != db.QualificationStepGrade {
+	if fresh.StrongZones != "" || fresh.WeakZonesInput != "" {
+		t.Errorf("new stakeholder qualification fields not reset: strong=%q weak=%q",
+			fresh.StrongZones, fresh.WeakZonesInput)
+	}
+	if fresh.QualificationStep != db.QualificationStepCurrentGrade {
 		t.Errorf("qualification_step not reset: got %d", fresh.QualificationStep)
 	}
 
@@ -1168,11 +1290,11 @@ func TestQualification_InvalidGradeDoesNotAdvanceOrCallLLM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetActiveSession: %v", err)
 	}
-	if session.Status != db.SessionStatusQualification || session.QualificationStep != db.QualificationStepGrade {
+	if session.Status != db.SessionStatusQualification || session.QualificationStep != db.QualificationStepCurrentGrade {
 		t.Fatalf("invalid grade must not advance qualification, got status=%s step=%d", session.Status, session.QualificationStep)
 	}
-	if session.Grade != "" {
-		t.Fatalf("invalid grade must not be stored, got %q", session.Grade)
+	if session.CurrentGrade != "" {
+		t.Fatalf("invalid grade must not be stored, got %q", session.CurrentGrade)
 	}
 	if len(lm.replies) != 1 {
 		t.Fatalf("qualification must not consume LLM replies")
@@ -1183,7 +1305,7 @@ func TestQualification_InvalidGradeDoesNotAdvanceOrCallLLM(t *testing.T) {
 		t.Fatalf("valid text grade: %v", err)
 	}
 	session, _ = repo.GetActiveSession(ctx, telegramID)
-	if session.Grade != "джун" || session.QualificationStep != db.QualificationStepDirection {
+	if session.CurrentGrade != "джун" || session.QualificationStep != db.QualificationStepTargetGrade {
 		t.Fatalf("valid grade should advance exactly once, got %+v", session)
 	}
 }
@@ -1289,7 +1411,7 @@ func TestQuestionCycle_RecoversLegacyCurrentQuestionWithoutAttempt(t *testing.T)
 	if err := h.handleQuestionCycle(context.Background(), ctx, student, session); err != nil {
 		t.Fatalf("handleQuestionCycle: %v", err)
 	}
-	if len(ctx.sent) != 2 || ctx.sent[1] != "legacy follow-up" {
+	if len(ctx.sent) != 2 || !strings.Contains(ctx.sent[1], "legacy follow-up") {
 		t.Fatalf("expected recovered attempt feedback and follow-up, got %v", ctx.sent)
 	}
 	attempt, err := repo.GetActiveQuestionAttempt(context.Background(), session.ID)
@@ -1323,6 +1445,31 @@ func TestQuestionCycle_RedeliversPrimaryFeedbackWithoutConsumingRetryText(t *tes
 	}
 }
 
+func TestQuestionCycle_RedeliversFollowupFeedbackWithoutConsumingRetryText(t *testing.T) {
+	repo := newFakeRepo()
+	student := &db.Student{TelegramID: 881}
+	session := &db.Session{ID: 1, StudentID: student.TelegramID, Status: db.SessionStatusQuestionCycle, Grade: "мидл"}
+	repo.sessions[session.ID] = session
+	repo.attempts[1] = &db.QuestionAttempt{
+		ID: 1, SessionID: session.ID, QuestionID: 9,
+		FollowupAnswer: "сохраненный второй ответ", FollowupFeedback: "сохраненная обратная связь 2",
+		Followup2Question: "сохраненное второе уточнение", Status: db.QuestionAttemptFollowupFeedbackReady,
+	}
+	h := New(repo, &fakeLLM{}, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, nil)
+	ctx := newCtx(student.TelegramID, "повтор второго ответа")
+
+	if err := h.handleQuestionCycle(context.Background(), ctx, student, session); err != nil {
+		t.Fatalf("handleQuestionCycle: %v", err)
+	}
+	if got := ctx.sent; len(got) != 2 || got[0] != "сохраненная обратная связь 2" || got[1] != "сохраненное второе уточнение" {
+		t.Fatalf("unexpected redelivery: %v", got)
+	}
+	attempt := repo.attempts[1]
+	if attempt.FollowupAnswer != "сохраненный второй ответ" || attempt.Status != db.QuestionAttemptWaitingFollowup2 {
+		t.Fatalf("retry text was consumed or state did not advance: %+v", attempt)
+	}
+}
+
 func TestQuestionCycle_RedeliversFinalFeedbackBeforeVector(t *testing.T) {
 	repo := newFakeRepo()
 	student := &db.Student{TelegramID: 89}
@@ -1335,7 +1482,8 @@ func TestQuestionCycle_RedeliversFinalFeedbackBeforeVector(t *testing.T) {
 	repo.questions[question.ID] = question
 	repo.attempts[1] = &db.QuestionAttempt{
 		ID: 1, SessionID: session.ID, QuestionID: question.ID,
-		FinalFeedback: "сохраненный полный разбор", Status: db.QuestionAttemptFinalFeedbackReady,
+		Followup2Feedback: "сохраненная мини-обратная связь",
+		FinalFeedback:     "сохраненный полный разбор", Status: db.QuestionAttemptFinalFeedbackReady,
 	}
 	h := New(repo, &fakeLLM{}, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, nil)
 	ctx := newCtx(student.TelegramID, "повтор после сетевой ошибки")
@@ -1343,11 +1491,39 @@ func TestQuestionCycle_RedeliversFinalFeedbackBeforeVector(t *testing.T) {
 	if err := h.handleQuestionCycle(context.Background(), ctx, student, session); err != nil {
 		t.Fatalf("handleQuestionCycle: %v", err)
 	}
-	if got := ctx.sent; len(got) != 2 || got[0] != "сохраненный полный разбор" || got[1] != "Куда двигаемся в следующем цикле?" {
+	if got := ctx.sent; len(got) != 3 || got[0] != "сохраненная мини-обратная связь" || got[1] != "сохраненный полный разбор" || got[2] != "Куда двигаемся в следующем блоке?" {
 		t.Fatalf("unexpected final feedback redelivery: %v", got)
 	}
 	if repo.attempts[1].Status != db.QuestionAttemptWaitingVector {
 		t.Fatalf("attempt status = %s, want WAITING_VECTOR", repo.attempts[1].Status)
+	}
+}
+
+func TestSplitBlockFeedback(t *testing.T) {
+	mini, full := splitBlockFeedback("▸ ОБРАТНАЯ СВЯЗЬ\nКоротко\n\n▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ\nКДИР")
+	if mini != "▸ ОБРАТНАЯ СВЯЗЬ\nКоротко" || full != "▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ\nКДИР" {
+		t.Fatalf("unexpected split: mini=%q full=%q", mini, full)
+	}
+}
+
+func TestAskNextQuestion_ExhaustedBankBuildsSummary(t *testing.T) {
+	repo := newFakeRepo()
+	student := &db.Student{TelegramID: 90, Name: "Тест"}
+	session := &db.Session{ID: 1, StudentID: student.TelegramID, Status: db.SessionStatusQuestionCycle, Grade: "мидл"}
+	repo.students[student.TelegramID] = student
+	repo.sessions[session.ID] = session
+	lm := &fakeLLM{pickErr: db.ErrNoMatchingQuestion, replies: []string{"Итог без вопросов"}}
+	h := New(repo, lm, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, nil)
+	ctx := newCtx(student.TelegramID, "")
+
+	if err := h.askNextQuestion(context.Background(), ctx, student, session); err != nil {
+		t.Fatalf("askNextQuestion: %v", err)
+	}
+	if got := ctx.sent; len(got) != 2 || !strings.Contains(got[0], "вопросы в банке закончились") || got[1] != "Итог без вопросов" {
+		t.Fatalf("unexpected exhaustion flow: %v", got)
+	}
+	if repo.sessions[session.ID].Status != db.SessionStatusCompleted {
+		t.Fatalf("session status = %s, want COMPLETED", repo.sessions[session.ID].Status)
 	}
 }
 
@@ -1533,7 +1709,11 @@ func TestRegister_AllEndpointsWrappedByRecovery(t *testing.T) {
 		{"/report command", "/report"},
 		{"restart callback", &btnRestart},
 		{"continue callback", &btnContinue},
-		{"grade callback", &btnGradeJunior},
+		{"current grade callback", &btnCurrentGradeJunior},
+		{"target grade callback", &btnTargetGradeJunior},
+		{"confirm profile callback", &btnConfirmProfile},
+		{"edit profile callback", &btnEditProfile},
+		{"KDIR ready callback", &btnReady},
 		{"vector callback", &btnVectorDeepen},
 		{"text message", tele.OnText},
 	}

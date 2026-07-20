@@ -30,6 +30,9 @@ profile.cov
 *.swo
 *~
 
+# Local reference documents
+*.pdf
+
 # macOS
 .DS_Store
 .AppleDouble

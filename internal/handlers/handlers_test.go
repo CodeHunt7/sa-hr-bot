@@ -40,6 +40,7 @@ type fakeContext struct {
 
 	sent         []string
 	sentEvents   []string
+	sentOptions  [][]interface{}
 	sentPhotos   []*tele.Photo
 	sentVideos   []*tele.Video
 	sentDocs     []*tele.Document
@@ -52,7 +53,8 @@ func (f *fakeContext) Text() string       { return f.text }
 func (f *fakeContext) Args() []string     { return f.args }
 func (f *fakeContext) Data() string       { return f.data }
 
-func (f *fakeContext) Send(what interface{}, _ ...interface{}) error {
+func (f *fakeContext) Send(what interface{}, options ...interface{}) error {
+	f.sentOptions = append(f.sentOptions, append([]interface{}(nil), options...))
 	switch v := what.(type) {
 	case string:
 		f.sent = append(f.sent, v)
@@ -741,6 +743,9 @@ func TestFullSessionFlow(t *testing.T) {
 	}
 	if len(readyCtx.sent) != 1 || !strings.Contains(readyCtx.sent[0], "q") || !strings.Contains(readyCtx.sent[0], "КДИР") {
 		t.Fatalf("expected first question after ready, got %v", readyCtx.sent)
+	}
+	if len(readyCtx.sentOptions) != 1 || len(readyCtx.sentOptions[0]) != 1 || readyCtx.sentOptions[0][0] != tele.ModeHTML {
+		t.Fatalf("expected primary question to use Telegram HTML mode, got %+v", readyCtx.sentOptions)
 	}
 	session, _ = repo.GetActiveSession(ctx, telegramID)
 	if session.Status != db.SessionStatusQuestionCycle {
@@ -1560,6 +1565,24 @@ func TestSplitBlockFeedback(t *testing.T) {
 	mini, full := splitBlockFeedback("▸ ОБРАТНАЯ СВЯЗЬ\nКоротко\n\n▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ\nКДИР")
 	if mini != "▸ ОБРАТНАЯ СВЯЗЬ\nКоротко" || full != "▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ\nКДИР" {
 		t.Fatalf("unexpected split: mini=%q full=%q", mini, full)
+	}
+}
+
+func TestFormatPrimaryQuestionBoldsOnlyQuestionAndEscapesHTML(t *testing.T) {
+	question := &db.QuestionBank{
+		QuestionContext: "Контекст про A & B",
+		QuestionText:    "Что выбрать: cache < database?",
+	}
+	got := formatPrimaryQuestion(question, true)
+
+	if !strings.Contains(got, "Контекст про A &amp; B") {
+		t.Fatalf("context was not escaped: %q", got)
+	}
+	if !strings.Contains(got, "<b>Что выбрать: cache &lt; database?</b>") {
+		t.Fatalf("question is not safely bolded: %q", got)
+	}
+	if strings.Contains(got, "<b>Отлично") || strings.Contains(got, "<b>Контекст") || strings.Contains(got, "КДИР.</b>") {
+		t.Fatalf("text outside the question was bolded: %q", got)
 	}
 }
 

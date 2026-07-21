@@ -7,6 +7,7 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"html"
 	"log/slog"
 	"os"
 	"regexp"
@@ -1261,7 +1262,7 @@ func (h *Handler) askNextQuestion(ctx context.Context, c tele.Context, student *
 	session.CurrentQuestionID = &question.ID
 	session.NextTopic = ""
 
-	return c.Send(formatPrimaryQuestion(question, session.CycleCount == 0))
+	return c.Send(formatPrimaryQuestion(question, session.CycleCount == 0), tele.ModeHTML)
 }
 
 func formatPrimaryQuestion(question *db.QuestionBank, first bool) string {
@@ -1273,8 +1274,8 @@ func formatPrimaryQuestion(question *db.QuestionBank, first bool) string {
 	if contextText == "" {
 		contextText = "Представь, что это вопрос с технического собеседования системного аналитика."
 	}
-	return fmt.Sprintf("%s\n\n%s\n\n%s\n\nОтветь текстом по формуле КДИР. Я разберу ответ и сразу дам обратную связь.",
-		lead, contextText, strings.TrimSpace(question.QuestionText))
+	return fmt.Sprintf("%s\n\n%s\n\n<b>%s</b>\n\nОтветь текстом по формуле КДИР. Я разберу ответ и сразу дам обратную связь.",
+		html.EscapeString(lead), html.EscapeString(contextText), html.EscapeString(strings.TrimSpace(question.QuestionText)))
 }
 
 func formatFollowupQuestion(contextText, questionText string, number int) string {

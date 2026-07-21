@@ -448,11 +448,26 @@ func (r *fakeRepo) CompleteQuestionAttempt(_ context.Context, sessionID, attempt
 	return nil
 }
 
+func (r *fakeRepo) ResumeQuestionCycle(_ context.Context, sessionID int64) error {
+	r.maybePanic()
+	session, ok := r.sessions[sessionID]
+	if !ok || session.Status != db.SessionStatusSummary || session.EndedAt != nil {
+		return errors.New("session is not waiting at summary")
+	}
+	session.Status = db.SessionStatusQuestionCycle
+	for i := len(r.summaries) - 1; i >= 0; i-- {
+		if r.summaries[i].SessionID == sessionID {
+			r.summaries = append(r.summaries[:i], r.summaries[i+1:]...)
+		}
+	}
+	return nil
+}
+
 func (r *fakeRepo) GetSessionAttemptReports(_ context.Context, sessionID int64) ([]db.QuestionAttemptReport, error) {
 	r.maybePanic()
 	var result []db.QuestionAttemptReport
 	for _, attempt := range r.attempts {
-		if attempt.SessionID != sessionID || attempt.Status != db.QuestionAttemptCompleted {
+		if attempt.SessionID != sessionID || (attempt.Status != db.QuestionAttemptCompleted && attempt.Status != db.QuestionAttemptWaitingVector) {
 			continue
 		}
 		question := r.questions[attempt.QuestionID]
@@ -550,7 +565,7 @@ func (f *fakeLLM) Reply(_ context.Context, userMessage string) (*llm.Reply, erro
 
 func TestRunSummaryReusesSavedReportAfterSendFailure(t *testing.T) {
 	repo := newFakeRepo()
-	student := &db.Student{TelegramID: 77, Name: "Тест"}
+	student := &db.Student{TelegramID: 77, Name: "Тест", AccessCode: "SA2026-TEST"}
 	repo.students[student.TelegramID] = student
 	session := &db.Session{
 		ID: 1, StudentID: student.TelegramID, Status: db.SessionStatusSummary,
@@ -570,11 +585,11 @@ func TestRunSummaryReusesSavedReportAfterSendFailure(t *testing.T) {
 	if lm.replyCalls != 0 {
 		t.Fatalf("saved summary should avoid another LLM call, got %d calls", lm.replyCalls)
 	}
-	if len(ctx.sent) != 1 || ctx.sent[0] != "Уже сохраненный итог" {
+	if len(ctx.sent) != 1 || !strings.Contains(ctx.sent[0], "Уже сохраненный итог") || !strings.Contains(ctx.sent[0], "/start SA2026-TEST") {
 		t.Fatalf("unexpected sent messages: %v", ctx.sent)
 	}
-	if repo.sessions[session.ID].Status != db.SessionStatusCompleted || repo.sessions[session.ID].EndedAt == nil {
-		t.Fatalf("session was not completed after recovered summary: %+v", repo.sessions[session.ID])
+	if repo.sessions[session.ID].Status != db.SessionStatusSummary || repo.sessions[session.ID].EndedAt != nil {
+		t.Fatalf("summary must keep session active: %+v", repo.sessions[session.ID])
 	}
 }
 
@@ -678,6 +693,10 @@ func TestFullSessionFlow(t *testing.T) {
 	if len(targetGradeCtx.sent) != 1 || targetGradeCtx.sent[0] != strongZonesQuestion {
 		t.Fatalf("expected strong zones question, got %v", targetGradeCtx.sent)
 	}
+	if !strings.Contains(targetGradeCtx.sent[0], "<i>выбери варианты и напиши мне их текстом</i>") ||
+		len(targetGradeCtx.sentOptions) != 1 || len(targetGradeCtx.sentOptions[0]) != 1 || targetGradeCtx.sentOptions[0][0] != tele.ModeHTML {
+		t.Fatalf("expected italic hint rendered as Telegram HTML, text=%q options=%+v", targetGradeCtx.sent[0], targetGradeCtx.sentOptions)
+	}
 
 	strongCtx := newCtx(telegramID, "Требования и архитектура")
 	if err := h.handleMessage(strongCtx); err != nil {
@@ -685,6 +704,10 @@ func TestFullSessionFlow(t *testing.T) {
 	}
 	if len(strongCtx.sent) != 1 || strongCtx.sent[0] != weakZonesQuestion {
 		t.Fatalf("expected weak zones question, got %v", strongCtx.sent)
+	}
+	if !strings.Contains(strongCtx.sent[0], "<i>выбери варианты и напиши мне их текстом</i>") ||
+		len(strongCtx.sentOptions) != 1 || len(strongCtx.sentOptions[0]) != 1 || strongCtx.sentOptions[0][0] != tele.ModeHTML {
+		t.Fatalf("expected italic hint rendered as Telegram HTML, text=%q options=%+v", strongCtx.sent[0], strongCtx.sentOptions)
 	}
 
 	session, _ = repo.GetActiveSession(ctx, telegramID)
@@ -877,15 +900,36 @@ func TestFullSessionFlow(t *testing.T) {
 	if err := h.handleVectorCallback(finishCtx); err != nil {
 		t.Fatalf("finish callback: %v", err)
 	}
-	if len(finishCtx.sent) != 1 || finishCtx.sent[0] != "Итоговый отчет" {
+	if len(finishCtx.sent) != 1 || !strings.Contains(finishCtx.sent[0], "Итоговый отчет") ||
+		!strings.Contains(finishCtx.sent[0], "/start SA2026-TEST") {
 		t.Fatalf("expected final summary, got %v", finishCtx.sent)
 	}
+	if len(finishCtx.sentOptions) != 1 || len(finishCtx.sentOptions[0]) != 1 || finishCtx.sentOptions[0][0] != summaryMenu {
+		t.Fatalf("expected return-to-questions button under summary, got %+v", finishCtx.sentOptions)
+	}
 
-	if _, err := repo.GetActiveSession(ctx, telegramID); !errors.Is(err, db.ErrNoActiveSession) {
-		t.Fatalf("expected no active session after summary, got %v", err)
+	activeAfterSummary, err := repo.GetActiveSession(ctx, telegramID)
+	if err != nil || activeAfterSummary.Status != db.SessionStatusSummary {
+		t.Fatalf("expected active summary session, got session=%+v err=%v", activeAfterSummary, err)
 	}
 	if len(repo.summaries) != 1 || repo.summaries[0].SummaryText != "Итоговый отчет" {
 		t.Fatalf("expected the summary to be saved, got %v", repo.summaries)
+	}
+
+	returnCtx := newCtx(telegramID, "")
+	returnCtx.data = "return"
+	if err := h.handleReturnToQuestionsCallback(returnCtx); err != nil {
+		t.Fatalf("return to questions callback: %v", err)
+	}
+	if len(returnCtx.sent) != 1 || returnCtx.sent[0] != "Куда двигаемся в следующем блоке?" {
+		t.Fatalf("expected topic selection after summary, got %v", returnCtx.sent)
+	}
+	activeAfterReturn, err := repo.GetActiveSession(ctx, telegramID)
+	if err != nil || activeAfterReturn.Status != db.SessionStatusQuestionCycle {
+		t.Fatalf("expected resumed question cycle, got session=%+v err=%v", activeAfterReturn, err)
+	}
+	if len(repo.summaries) != 0 {
+		t.Fatalf("stale summary must be deleted before continuing, got %v", repo.summaries)
 	}
 	if lm.evalCalls != 2 || lm.followupEvalCalls != 2 || lm.blockEvalCalls != 2 {
 		t.Fatalf("expected two evaluations at every answer position, got primary=%d followup=%d block=%d", lm.evalCalls, lm.followupEvalCalls, lm.blockEvalCalls)
@@ -962,6 +1006,36 @@ func TestRestartDuringActiveSession(t *testing.T) {
 	}
 	if newSession.ID == firstSession.ID {
 		t.Fatalf("expected a fresh session, got the same ID as the abandoned one")
+	}
+}
+
+func TestStartWithOriginalCodeImmediatelyStartsOver(t *testing.T) {
+	repo := newFakeRepo("SA2026-TEST")
+	h := New(repo, &fakeLLM{}, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, nil)
+	const telegramID = 8
+
+	if err := h.handleStart(newCtx(telegramID, "/start SA2026-TEST", "SA2026-TEST")); err != nil {
+		t.Fatalf("initial start: %v", err)
+	}
+	oldSession, err := repo.GetActiveSession(context.Background(), telegramID)
+	if err != nil {
+		t.Fatalf("get initial session: %v", err)
+	}
+
+	restart := newCtx(telegramID, "/start SA2026-TEST", "SA2026-TEST")
+	if err := h.handleStart(restart); err != nil {
+		t.Fatalf("restart by original code: %v", err)
+	}
+	if len(restart.sent) != 2 || restart.sent[0] != instructionMessage || restart.sent[1] != currentGradeQuestion {
+		t.Fatalf("expected immediate fresh qualification, got %v", restart.sent)
+	}
+	oldAfter, err := repo.sessionByID(oldSession.ID)
+	if err != nil || oldAfter.Status != db.SessionStatusAbandoned || oldAfter.EndedAt == nil {
+		t.Fatalf("old session must remain as abandoned history, session=%+v err=%v", oldAfter, err)
+	}
+	fresh, err := repo.GetActiveSession(context.Background(), telegramID)
+	if err != nil || fresh.ID == oldSession.ID || fresh.Status != db.SessionStatusQualification {
+		t.Fatalf("expected fresh qualification session, session=%+v err=%v", fresh, err)
 	}
 }
 
@@ -1597,7 +1671,7 @@ func TestFormatPrimaryQuestionBoldsOnlyQuestionAndEscapesHTML(t *testing.T) {
 
 func TestAskNextQuestion_ExhaustedBankBuildsSummary(t *testing.T) {
 	repo := newFakeRepo()
-	student := &db.Student{TelegramID: 90, Name: "Тест"}
+	student := &db.Student{TelegramID: 90, Name: "Тест", AccessCode: "SA2026-EMPTY"}
 	session := &db.Session{ID: 1, StudentID: student.TelegramID, Status: db.SessionStatusQuestionCycle, Grade: "мидл"}
 	repo.students[student.TelegramID] = student
 	repo.sessions[session.ID] = session
@@ -1608,11 +1682,12 @@ func TestAskNextQuestion_ExhaustedBankBuildsSummary(t *testing.T) {
 	if err := h.askNextQuestion(context.Background(), ctx, student, session); err != nil {
 		t.Fatalf("askNextQuestion: %v", err)
 	}
-	if got := ctx.sent; len(got) != 2 || !strings.Contains(got[0], "вопросы в банке закончились") || got[1] != "Итог без вопросов" {
+	if got := ctx.sent; len(got) != 2 || !strings.Contains(got[0], "вопросы в банке закончились") ||
+		!strings.Contains(got[1], "Итог без вопросов") || !strings.Contains(got[1], "/start SA2026-EMPTY") {
 		t.Fatalf("unexpected exhaustion flow: %v", got)
 	}
-	if repo.sessions[session.ID].Status != db.SessionStatusCompleted {
-		t.Fatalf("session status = %s, want COMPLETED", repo.sessions[session.ID].Status)
+	if repo.sessions[session.ID].Status != db.SessionStatusSummary || repo.sessions[session.ID].EndedAt != nil {
+		t.Fatalf("session must remain active at summary: %+v", repo.sessions[session.ID])
 	}
 }
 
@@ -1804,6 +1879,7 @@ func TestRegister_AllEndpointsWrappedByRecovery(t *testing.T) {
 		{"edit profile callback", &btnEditProfile},
 		{"KDIR ready callback", &btnReady},
 		{"vector callback", &btnVectorDeepen},
+		{"summary return callback", &btnReturnToQuestions},
 		{"text message", tele.OnText},
 	}
 

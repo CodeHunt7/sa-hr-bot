@@ -793,8 +793,41 @@ func (r *Repository) CompleteQuestionAttempt(ctx context.Context, sessionID, att
 	return nil
 }
 
-// GetSessionAttemptReports returns completed cycles in chronological order for
-// the final report prompt.
+// ResumeQuestionCycle reopens a session whose summary was shown. The current
+// WAITING_VECTOR attempt remains available so the student can choose the next
+// topic. Deleting the saved summary forces a later finish to include any new
+// answers instead of returning a stale report.
+func (r *Repository) ResumeQuestionCycle(ctx context.Context, sessionID int64) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("resume question cycle begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE sessions SET status = $2
+		 WHERE id = $1 AND status = $3 AND ended_at IS NULL`,
+		sessionID, SessionStatusQuestionCycle, SessionStatusSummary,
+	)
+	if err != nil {
+		return fmt.Errorf("resume question cycle update session: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("resume question cycle: session %d is not waiting at summary", sessionID)
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM session_summaries WHERE session_id = $1`, sessionID); err != nil {
+		return fmt.Errorf("resume question cycle delete stale summary: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("resume question cycle commit: %w", err)
+	}
+	return nil
+}
+
+// GetSessionAttemptReports returns evaluated cycles in chronological order for
+// the final report prompt. The latest cycle may still be WAITING_VECTOR because
+// choosing "finish" must keep it available for returning to topic selection.
 func (r *Repository) GetSessionAttemptReports(ctx context.Context, sessionID int64) ([]QuestionAttemptReport, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT q.question_text, q.topic, a.primary_answer, a.followup_question,
@@ -802,9 +835,9 @@ func (r *Repository) GetSessionAttemptReports(ctx context.Context, sessionID int
 		        a.final_feedback
 		 FROM question_attempts a
 		 JOIN question_bank q ON q.id = a.question_id
-		 WHERE a.session_id = $1 AND a.status = $2
+		 WHERE a.session_id = $1 AND a.status = ANY($2)
 		 ORDER BY a.id`,
-		sessionID, QuestionAttemptCompleted,
+		sessionID, []string{QuestionAttemptCompleted, QuestionAttemptWaitingVector},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("get session attempt reports: %w", err)

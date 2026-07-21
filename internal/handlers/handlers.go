@@ -84,7 +84,9 @@ const (
 - Базы данных
 - Архитектура
 - Требования
-- Безопасность`
+- Безопасность
+
+<i>выбери варианты и напиши мне их текстом</i>`
 	weakZonesQuestion = `Вопрос 4/4
 Какие технические зоны ты знаешь хуже всего?
 
@@ -93,7 +95,9 @@ const (
 - Базы данных
 - Архитектура
 - Требования
-- Безопасность`
+- Безопасность
+
+<i>выбери варианты и напиши мне их текстом</i>`
 	kdirLessonMessage = `Отлично, прежде чем начнём отработку - один короткий урок.
 
 Разбираю в нём формулу КДИР: Контекст, Действие, Инструмент, Результат.
@@ -157,6 +161,9 @@ var (
 	readyMenu = &tele.ReplyMarkup{}
 	btnReady  = readyMenu.Data("Готов(а)", "kdir_ready", "ready")
 
+	summaryMenu          = &tele.ReplyMarkup{}
+	btnReturnToQuestions = summaryMenu.Data("Вернуться к вопросам", "summary_return", "return")
+
 	vectorMenu         = &tele.ReplyMarkup{}
 	btnVectorDeepen    = vectorMenu.Data("Углубиться в тему", "question_vector", "deepen")
 	btnVectorOtherWeak = vectorMenu.Data("Другая слабая зона", "question_vector", "other_weak")
@@ -173,6 +180,7 @@ func init() {
 		confirmationMenu.Row(btnEditProfile),
 	)
 	readyMenu.Inline(readyMenu.Row(btnReady))
+	summaryMenu.Inline(summaryMenu.Row(btnReturnToQuestions))
 	vectorMenu.Inline(
 		vectorMenu.Row(btnVectorDeepen),
 		vectorMenu.Row(btnVectorOtherWeak),
@@ -204,6 +212,7 @@ type Repository interface {
 	FinalizeQuestionAttempt(ctx context.Context, sessionID, studentID, attemptID int64, answer, miniFeedback, fullFeedback, zoneTopic, zoneStatus string) (int, error)
 	MarkFinalFeedbackDelivered(ctx context.Context, attemptID int64) error
 	CompleteQuestionAttempt(ctx context.Context, sessionID, attemptID int64, selectedVector, nextTopic string) error
+	ResumeQuestionCycle(ctx context.Context, sessionID int64) error
 	GetSessionAttemptReports(ctx context.Context, sessionID int64) ([]db.QuestionAttemptReport, error)
 	SaveSummary(ctx context.Context, sessionID int64, summaryText string) (*db.SessionSummary, error)
 	GetSummaryBySessionID(ctx context.Context, sessionID int64) (*db.SessionSummary, error)
@@ -294,6 +303,7 @@ func (h *Handler) Register(bot *tele.Bot) {
 	h.handle(bot, &btnEditProfile, h.handleEditProfileCallback)
 	h.handle(bot, &btnReady, h.handleReadyCallback)
 	h.handle(bot, &btnVectorDeepen, h.handleVectorCallback)
+	h.handle(bot, &btnReturnToQuestions, h.handleReturnToQuestionsCallback)
 	h.handle(bot, tele.OnText, h.handleMessage)
 }
 
@@ -540,6 +550,23 @@ func (h *Handler) handleStart(c tele.Context) error {
 		return c.Send(genericErrorMessage)
 	}
 
+	// A registered student can use the same personal code shown in the final
+	// message to explicitly start over. The old session and all its answers stay
+	// in PostgreSQL as ABANDONED history; only a fresh active session is created.
+	if len(c.Args()) > 0 && strings.TrimSpace(c.Args()[0]) == student.AccessCode {
+		session, sessionErr := h.repo.GetActiveSession(ctx, student.TelegramID)
+		if sessionErr == nil {
+			if endErr := h.repo.EndSession(ctx, session.ID, db.SessionStatusAbandoned); endErr != nil {
+				h.logger.Error("restart session by access code", "error", endErr, "session_id", session.ID)
+				return c.Send(genericErrorMessage)
+			}
+		} else if !errors.Is(sessionErr, db.ErrNoActiveSession) {
+			h.logger.Error("get active session for code restart", "error", sessionErr)
+			return c.Send(genericErrorMessage)
+		}
+		return h.startFreshSession(ctx, c, student)
+	}
+
 	_, err = h.repo.GetActiveSession(ctx, student.TelegramID)
 	switch {
 	case errors.Is(err, db.ErrNoActiveSession):
@@ -652,7 +679,7 @@ func (h *Handler) handleGradeCallback(c tele.Context) error {
 	if step == db.QualificationStepCurrentGrade {
 		return c.Send(targetGradeQuestion, targetGradeMenu)
 	}
-	return c.Send(strongZonesQuestion)
+	return c.Send(strongZonesQuestion, tele.ModeHTML)
 }
 
 // handleRestartCallback ends the student's active session as abandoned
@@ -727,6 +754,9 @@ func (h *Handler) handleContinueCallback(c tele.Context) error {
 	if err != nil {
 		h.logger.Error("get active session", "error", err)
 		return c.Send(genericErrorMessage)
+	}
+	if session.Status == db.SessionStatusSummary {
+		return h.runSummary(ctx, c, student, session)
 	}
 
 	return h.resumeCurrentStep(ctx, c, session)
@@ -812,13 +842,13 @@ func (h *Handler) handleQualification(ctx context.Context, c tele.Context, stude
 		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepTargetGrade, grade); err != nil {
 			return h.qualificationSaveError(c, session.ID, err)
 		}
-		return c.Send(strongZonesQuestion)
+		return c.Send(strongZonesQuestion, tele.ModeHTML)
 
 	case db.QualificationStepStrongZones:
 		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepStrongZones, answer); err != nil {
 			return h.qualificationSaveError(c, session.ID, err)
 		}
-		return c.Send(weakZonesQuestion)
+		return c.Send(weakZonesQuestion, tele.ModeHTML)
 
 	case db.QualificationStepWeakZones:
 		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepWeakZones, answer); err != nil {
@@ -1095,9 +1125,9 @@ func (h *Handler) resumeCurrentStep(ctx context.Context, c tele.Context, session
 		case db.QualificationStepTargetGrade:
 			return c.Send(targetGradeQuestion, targetGradeMenu)
 		case db.QualificationStepStrongZones:
-			return c.Send(strongZonesQuestion)
+			return c.Send(strongZonesQuestion, tele.ModeHTML)
 		case db.QualificationStepWeakZones:
-			return c.Send(weakZonesQuestion)
+			return c.Send(weakZonesQuestion, tele.ModeHTML)
 		default:
 			return sendQualificationConfirmation(c, session)
 		}
@@ -1567,10 +1597,6 @@ func (h *Handler) handleVectorCallback(c tele.Context) error {
 	parts := strings.Split(selectedVector, "|")
 	switch parts[0] {
 	case "finish":
-		if err := h.repo.CompleteQuestionAttempt(ctx, session.ID, attempt.ID, selectedVector, ""); err != nil {
-			h.logger.Error("complete question attempt before summary", "error", err, "attempt_id", attempt.ID)
-			return c.Send(genericErrorMessage)
-		}
 		if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusSummary); err != nil {
 			h.logger.Error("advance phase", "error", err, "session_id", session.ID)
 			return c.Send(genericErrorMessage)
@@ -1604,6 +1630,41 @@ func (h *Handler) handleVectorCallback(c tele.Context) error {
 	session.CurrentQuestionID = nil
 	session.NextTopic = nextTopic
 	return h.askNextQuestion(ctx, c, student, session)
+}
+
+func (h *Handler) handleReturnToQuestionsCallback(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		h.logger.Warn("respond return-to-questions callback", "error", err)
+	}
+	telegramID := senderID(c)
+	unlock := h.lockStudent(telegramID)
+	defer unlock()
+	ctx, cancel := newHandlerContext()
+	defer cancel()
+
+	student, err := h.repo.GetStudentByTelegramID(ctx, telegramID)
+	if err != nil {
+		h.logger.Error("get student for summary return", "error", err)
+		return c.Send(genericErrorMessage)
+	}
+	session, err := h.repo.GetActiveSession(ctx, student.TelegramID)
+	if err != nil || session.Status != db.SessionStatusSummary {
+		return c.Send("Эта кнопка уже неактуальна. Продолжаем с текущего шага.")
+	}
+	attempt, err := h.repo.GetActiveQuestionAttempt(ctx, session.ID)
+	if err != nil || attempt.Status != db.QuestionAttemptWaitingVector {
+		return c.Send("Вернуться не получится: подходящие вопросы в банке закончились. Чтобы начать заново, отправь /start и свой код.")
+	}
+	question, err := h.repo.GetQuestionByID(ctx, attempt.QuestionID)
+	if err != nil {
+		h.logger.Error("get last question for summary return", "error", err, "attempt_id", attempt.ID)
+		return c.Send(genericErrorMessage)
+	}
+	if err := h.repo.ResumeQuestionCycle(ctx, session.ID); err != nil {
+		h.logger.Error("resume question cycle from summary", "error", err, "session_id", session.ID)
+		return c.Send(genericErrorMessage)
+	}
+	return c.Send("Куда двигаемся в следующем блоке?", buildVectorMenu(session.WeakTopics, question.Topic))
 }
 
 func buildVectorMenu(weakTopics, currentTopic string) *tele.ReplyMarkup {
@@ -1645,17 +1706,11 @@ func nextWeakTopic(weakTopics, currentTopic string) string {
 	return ""
 }
 
-// runSummary runs phase 4: ask the model for the final report, save it,
-// and close out the session.
+// runSummary runs phase 4 and saves the report without deleting or closing the
+// session. The student can return to topic selection and continue training.
 func (h *Handler) runSummary(ctx context.Context, c tele.Context, student *db.Student, session *db.Session) error {
 	if saved, err := h.repo.GetSummaryBySessionID(ctx, session.ID); err == nil {
-		if err := sendText(c, saved.SummaryText); err != nil {
-			return err
-		}
-		if err := h.repo.EndSession(ctx, session.ID, db.SessionStatusCompleted); err != nil {
-			h.logger.Error("end session after recovered summary", "error", err, "session_id", session.ID)
-		}
-		return nil
+		return h.sendSavedSummary(ctx, c, student, session, saved.SummaryText)
 	} else if !errors.Is(err, db.ErrSummaryNotFound) {
 		h.logger.Error("get existing summary", "error", err, "session_id", session.ID)
 		return c.Send(genericErrorMessage)
@@ -1690,15 +1745,16 @@ func (h *Handler) runSummary(ctx context.Context, c tele.Context, student *db.St
 		return c.Send(genericErrorMessage)
 	}
 
-	if err := sendText(c, reply.Text); err != nil {
-		return err
-	}
+	return h.sendSavedSummary(ctx, c, student, session, reply.Text)
+}
 
-	if err := h.repo.EndSession(ctx, session.ID, db.SessionStatusCompleted); err != nil {
-		h.logger.Error("end session", "error", err, "session_id", session.ID)
+func (h *Handler) sendSavedSummary(ctx context.Context, c tele.Context, student *db.Student, session *db.Session, summary string) error {
+	message := fmt.Sprintf("%s\n\nЕсли хочешь начать с самого начала, отправь /start %s", strings.TrimSpace(summary), student.AccessCode)
+	attempt, err := h.repo.GetActiveQuestionAttempt(ctx, session.ID)
+	if err == nil && attempt.Status == db.QuestionAttemptWaitingVector {
+		return sendText(c, message, summaryMenu)
 	}
-
-	return nil
+	return sendText(c, message)
 }
 
 // handleReport is an admin-only export of every registered student:

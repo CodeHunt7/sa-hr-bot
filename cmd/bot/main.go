@@ -82,7 +82,9 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	h := handlers.New(repo, llmService, logger, cfg.SessionCycleLimit, cfg.AdminIDs)
+	h := handlers.New(repo, llmService, logger, cfg.SessionCycleLimit, cfg.AdminIDs, handlers.MediaConfig{
+		KDIRVideoFileID: cfg.KDIRVideoFileID,
+	})
 
 	bot, err := tele.NewBot(tele.Settings{
 		Token:  cfg.TelegramBotToken,

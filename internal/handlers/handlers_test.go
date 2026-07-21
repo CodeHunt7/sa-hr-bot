@@ -40,6 +40,7 @@ type fakeContext struct {
 
 	sent         []string
 	sentPhotos   []*tele.Photo
+	sentVideos   []*tele.Video
 	sentDocs     []*tele.Document
 	sentDocBytes [][]byte
 	responded    bool
@@ -56,6 +57,8 @@ func (f *fakeContext) Send(what interface{}, _ ...interface{}) error {
 		f.sent = append(f.sent, v)
 	case *tele.Photo:
 		f.sentPhotos = append(f.sentPhotos, v)
+	case *tele.Video:
+		f.sentVideos = append(f.sentVideos, v)
 	case *tele.Document:
 		f.sentDocs = append(f.sentDocs, v)
 		// Read the file now: handleReport removes it (defer os.Remove)
@@ -714,6 +717,9 @@ func TestFullSessionFlow(t *testing.T) {
 	if len(confirmCtx.sentPhotos) != 1 || confirmCtx.sentPhotos[0].FileLocal != readyPhotoPath {
 		t.Fatalf("expected ready photo, got %+v", confirmCtx.sentPhotos)
 	}
+	if len(confirmCtx.sentVideos) != 1 || confirmCtx.sentVideos[0].FileLocal != kdirVideoPath || !confirmCtx.sentVideos[0].Streaming {
+		t.Fatalf("expected local streaming KDIR video, got %+v", confirmCtx.sentVideos)
+	}
 	session, _ = repo.GetActiveSession(ctx, telegramID)
 	if session.Status != db.SessionStatusKDIRLesson || session.WeakTopics != "интеграции,бд" {
 		t.Fatalf("expected KDIR lesson with deterministic topics, got %+v", session)
@@ -872,6 +878,20 @@ func TestFullSessionFlow(t *testing.T) {
 	}
 	if lm.pickCalls != 2 {
 		t.Fatalf("expected exactly 2 picked primary questions, got %d", lm.pickCalls)
+	}
+}
+
+func TestSendKDIRVideoUsesConfiguredTelegramFileID(t *testing.T) {
+	h := New(newFakeRepo(), &fakeLLM{}, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, nil, MediaConfig{
+		KDIRVideoFileID: "telegram-video-id",
+	})
+	ctx := newCtx(42, "")
+
+	if err := h.sendKDIRVideo(ctx); err != nil {
+		t.Fatalf("sendKDIRVideo: %v", err)
+	}
+	if len(ctx.sentVideos) != 1 || ctx.sentVideos[0].FileID != "telegram-video-id" || ctx.sentVideos[0].FileLocal != "" {
+		t.Fatalf("expected Telegram file_id without local upload, got %+v", ctx.sentVideos)
 	}
 }
 

@@ -20,6 +20,7 @@ type Config struct {
 	OpenAIBaseURL    string // optional, used when routing OpenAI calls through a proxy
 	OpenAIModel      string // optional, e.g. "gpt-4.1-mini"; empty means llm.New picks its default
 	DatabaseURL      string
+	KDIRVideoFileID  string // optional Telegram file_id; empty uploads media/vid1-kdir.mp4
 
 	// SessionCycleLimit is the number of question cycles (system prompt
 	// phase 3) per interview session. It is substituted into the
@@ -45,6 +46,7 @@ func Load() (*Config, error) {
 		OpenAIBaseURL:    os.Getenv("OPENAI_BASE_URL"),
 		OpenAIModel:      os.Getenv("OPENAI_MODEL"),
 		DatabaseURL:      os.Getenv("DATABASE_URL"),
+		KDIRVideoFileID:  os.Getenv("KDIR_VIDEO_FILE_ID"),
 	}
 
 	if cfg.TelegramBotToken == "" {

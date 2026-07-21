@@ -59,6 +59,7 @@ const (
 const (
 	welcomePhotoPath = "media/pic1.PNG"
 	readyPhotoPath   = "media/pic2.PNG"
+	kdirVideoPath    = "media/vid1-kdir.mp4"
 
 	instructionMessage = `Привет. Меня зовут Катя Желатинка, я собрала для тебя тренажёр для отработки технических собеседований системного аналитика.
 
@@ -223,10 +224,18 @@ type Handler struct {
 	logger            *slog.Logger
 	sessionCycleLimit int
 	adminIDs          map[int64]bool
+	kdirVideoFileID   string
 	studentLocks      [studentLockStripeCount]sync.Mutex
 	lifecycleMu       sync.Mutex
 	handlerWG         sync.WaitGroup
 	acceptingHandlers bool
+}
+
+// MediaConfig contains optional Telegram-side media references. With a file_id
+// Telegram reuses an already uploaded video; local development falls back to
+// the versioned MP4 in media/.
+type MediaConfig struct {
+	KDIRVideoFileID string
 }
 
 // New creates a Handler with its dependencies. sessionCycleLimit is the
@@ -234,12 +243,12 @@ type Handler struct {
 // the handler uses its copy to show a continue-or-finish checkpoint after each
 // configured number of completed blocks. adminIDs are the Telegram user IDs
 // allowed to run /report.
-func New(repo Repository, llmService LLM, logger *slog.Logger, sessionCycleLimit int, adminIDs []int64) *Handler {
+func New(repo Repository, llmService LLM, logger *slog.Logger, sessionCycleLimit int, adminIDs []int64, media ...MediaConfig) *Handler {
 	ids := make(map[int64]bool, len(adminIDs))
 	for _, id := range adminIDs {
 		ids[id] = true
 	}
-	return &Handler{
+	h := &Handler{
 		repo:              repo,
 		llm:               llmService,
 		logger:            logger,
@@ -247,6 +256,10 @@ func New(repo Repository, llmService LLM, logger *slog.Logger, sessionCycleLimit
 		adminIDs:          ids,
 		acceptingHandlers: true,
 	}
+	if len(media) > 0 {
+		h.kdirVideoFileID = strings.TrimSpace(media[0].KDIRVideoFileID)
+	}
+	return h
 }
 
 // Register attaches all command/message/callback handlers to the bot.
@@ -892,9 +905,29 @@ func sendPhoto(c tele.Context, path string) error {
 	return c.Send(&tele.Photo{File: tele.FromDisk(path)})
 }
 
+func (h *Handler) sendKDIRVideo(c tele.Context) error {
+	file := tele.FromDisk(kdirVideoPath)
+	if h.kdirVideoFileID != "" {
+		file = tele.File{FileID: h.kdirVideoFileID}
+	}
+	return c.Send(&tele.Video{
+		File:      file,
+		Width:     1280,
+		Height:    720,
+		Duration:  239,
+		Streaming: true,
+		MIME:      "video/mp4",
+		FileName:  "vid1-kdir.mp4",
+	})
+}
+
 func (h *Handler) sendKDIRLesson(c tele.Context, sessionID int64) error {
 	if err := c.Send(kdirLessonMessage); err != nil {
 		return err
+	}
+	if err := h.sendKDIRVideo(c); err != nil {
+		h.logger.Error("send KDIR video", "error", err, "session_id", sessionID)
+		return c.Send(genericErrorMessage)
 	}
 	if err := sendPhoto(c, readyPhotoPath); err != nil {
 		h.logger.Error("send ready photo", "error", err, "session_id", sessionID)

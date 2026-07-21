@@ -59,7 +59,7 @@ internal/llm/          клиент и сервис OpenAI API
 internal/db/           модели, репозиторий, подключение к БД (PostgreSQL/pgx)
 internal/migrations/   SQL-миграции (Goose) + логика применения
 prompts/                системный промпт в .md
-media/                  картинки приветствия и старта тренажёра
+media/                  картинки и видео урока КДИР
 ```
 
 ## Запуск локально

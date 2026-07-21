@@ -1568,6 +1568,15 @@ func TestSplitBlockFeedback(t *testing.T) {
 	}
 }
 
+func TestNormalizeFeedbackHeadingSpacing(t *testing.T) {
+	input := "▸ ОБРАТНАЯ СВЯЗЬ текст сразу\n\n\n▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ\nтекст большого разбора"
+	got := normalizeFeedbackHeadingSpacing(input)
+	want := "▸ ОБРАТНАЯ СВЯЗЬ\n\nтекст сразу\n\n\n▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ\n\nтекст большого разбора"
+	if got != want {
+		t.Fatalf("unexpected normalized feedback:\nwant: %q\n got: %q", want, got)
+	}
+}
+
 func TestFormatPrimaryQuestionBoldsOnlyQuestionAndEscapesHTML(t *testing.T) {
 	question := &db.QuestionBank{
 		QuestionContext: "Контекст про A & B",

@@ -117,6 +117,9 @@ var weakZoneStatusMarkerRE = regexp.MustCompile(`(?im)^[ \t]*WEAK_ZONE_STATUS[ \
 
 var bigFeedbackHeadingRE = regexp.MustCompile(`(?im)^[ \t]*▸[ \t]*БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ[ \t]*$`)
 
+var feedbackHeadingSpacingRE = regexp.MustCompile(`(?im)^[ \t]*▸[ \t]*ОБРАТНАЯ СВЯЗЬ[ \t]*(?:\r?\n[ \t]*)*`)
+var bigFeedbackHeadingSpacingRE = regexp.MustCompile(`(?im)^[ \t]*▸[ \t]*БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ[ \t]*(?:\r?\n[ \t]*)*`)
+
 // validTopics mirrors question_bank.topic's allowed values (see
 // db.QuestionBank's doc comment). Used to discard any WEAK_TOPICS value
 // the model might hallucinate outside that fixed set, since PickQuestion
@@ -1362,12 +1365,13 @@ func (h *Handler) evaluatePrimaryAnswer(ctx context.Context, c tele.Context, stu
 	}
 	followup = formatFollowupQuestion(followupContext, followup, 1)
 
-	if err := h.repo.SavePrimaryFeedback(ctx, attempt.ID, answer, reply.Text, followup); err != nil {
+	feedback := normalizeFeedbackHeadingSpacing(reply.Text)
+	if err := h.repo.SavePrimaryFeedback(ctx, attempt.ID, answer, feedback, followup); err != nil {
 		h.logger.Error("save primary feedback", "error", err, "attempt_id", attempt.ID)
 		return c.Send(genericErrorMessage)
 	}
 
-	attempt.PrimaryFeedback = reply.Text
+	attempt.PrimaryFeedback = feedback
 	attempt.FollowupQuestion = followup
 	attempt.Status = db.QuestionAttemptPrimaryFeedbackReady
 	return h.deliverPrimaryFeedback(ctx, c, attempt)
@@ -1423,12 +1427,13 @@ func (h *Handler) evaluateFollowupAnswer(ctx context.Context, c tele.Context, st
 		followup2 = "Какой конкретный результат получился и как ты понял, что выбранный подход сработал?"
 	}
 	followup2 = formatFollowupQuestion(question.Followup2Context, followup2, 2)
-	if err := h.repo.SaveFollowupFeedback(ctx, attempt.ID, answer, reply.Text, followup2); err != nil {
+	feedback := normalizeFeedbackHeadingSpacing(reply.Text)
+	if err := h.repo.SaveFollowupFeedback(ctx, attempt.ID, answer, feedback, followup2); err != nil {
 		h.logger.Error("save followup feedback", "error", err, "attempt_id", attempt.ID)
 		return c.Send(genericErrorMessage)
 	}
 	attempt.FollowupAnswer = answer
-	attempt.FollowupFeedback = reply.Text
+	attempt.FollowupFeedback = feedback
 	attempt.Followup2Question = followup2
 	attempt.Status = db.QuestionAttemptFollowupFeedbackReady
 	return h.deliverFollowupFeedback(ctx, c, attempt)
@@ -1487,7 +1492,7 @@ func (h *Handler) evaluateSecondFollowupAnswer(ctx context.Context, c tele.Conte
 	if validTopics[strings.ToLower(question.Topic)] {
 		zoneTopic = strings.ToLower(question.Topic)
 	}
-	miniFeedback, fullFeedback := splitBlockFeedback(cleaned)
+	miniFeedback, fullFeedback := splitBlockFeedback(normalizeFeedbackHeadingSpacing(cleaned))
 
 	count, err := h.repo.FinalizeQuestionAttempt(
 		ctx, session.ID, student.TelegramID, attempt.ID,
@@ -1859,6 +1864,16 @@ func splitBlockFeedback(text string) (mini, full string) {
 		mini = "▸ ОБРАТНАЯ СВЯЗЬ\nОтвет принят и учтён в общем разборе блока."
 	}
 	return mini, full
+}
+
+// normalizeFeedbackHeadingSpacing makes feedback frames visually scannable
+// regardless of whether the model put the body on the heading line, the next
+// line, or after several blank lines. Two newlines mean one visible empty line
+// between the heading and its content in Telegram.
+func normalizeFeedbackHeadingSpacing(text string) string {
+	text = bigFeedbackHeadingSpacingRE.ReplaceAllString(text, "▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ\n\n")
+	text = feedbackHeadingSpacingRE.ReplaceAllString(text, "▸ ОБРАТНАЯ СВЯЗЬ\n\n")
+	return strings.TrimSpace(text)
 }
 
 // sendText splits long model output below Telegram's message limit. Optional

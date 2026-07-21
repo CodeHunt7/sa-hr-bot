@@ -39,6 +39,7 @@ type fakeContext struct {
 	data   string
 
 	sent         []string
+	sentEvents   []string
 	sentPhotos   []*tele.Photo
 	sentVideos   []*tele.Video
 	sentDocs     []*tele.Document
@@ -55,12 +56,16 @@ func (f *fakeContext) Send(what interface{}, _ ...interface{}) error {
 	switch v := what.(type) {
 	case string:
 		f.sent = append(f.sent, v)
+		f.sentEvents = append(f.sentEvents, "text")
 	case *tele.Photo:
 		f.sentPhotos = append(f.sentPhotos, v)
+		f.sentEvents = append(f.sentEvents, "photo")
 	case *tele.Video:
 		f.sentVideos = append(f.sentVideos, v)
+		f.sentEvents = append(f.sentEvents, "video")
 	case *tele.Document:
 		f.sentDocs = append(f.sentDocs, v)
+		f.sentEvents = append(f.sentEvents, "document")
 		// Read the file now: handleReport removes it (defer os.Remove)
 		// right after Send returns, so this is the only chance to
 		// inspect what was actually written.
@@ -694,9 +699,10 @@ func TestFullSessionFlow(t *testing.T) {
 	if err := h.handleMessage(qualDoneCtx); err != nil {
 		t.Fatalf("weak zones answer: %v", err)
 	}
-	if len(qualDoneCtx.sent) != 1 || !strings.Contains(qualDoneCtx.sent[0], "Текущий грейд: джун") ||
-		!strings.Contains(qualDoneCtx.sent[0], "Интеграции и Базы данных") {
-		t.Fatalf("expected profile confirmation, got %v", qualDoneCtx.sent)
+	if len(qualDoneCtx.sent) != 0 || len(qualDoneCtx.sentPhotos) != 1 || qualDoneCtx.sentPhotos[0].FileLocal != readyPhotoPath ||
+		!strings.Contains(qualDoneCtx.sentPhotos[0].Caption, "Текущий грейд: Джун") ||
+		!strings.Contains(qualDoneCtx.sentPhotos[0].Caption, "Интеграции и Базы данных") {
+		t.Fatalf("expected profile confirmation attached to pic2, got text=%v photos=%+v", qualDoneCtx.sent, qualDoneCtx.sentPhotos)
 	}
 	session, _ = repo.GetActiveSession(ctx, telegramID)
 	if session.Status != db.SessionStatusProfileConfirmation || session.QualificationStep != db.QualificationStepDone {
@@ -711,14 +717,17 @@ func TestFullSessionFlow(t *testing.T) {
 	if err := h.handleConfirmProfileCallback(confirmCtx); err != nil {
 		t.Fatalf("confirm profile: %v", err)
 	}
-	if len(confirmCtx.sent) != 2 || confirmCtx.sent[0] != kdirLessonMessage || confirmCtx.sent[1] != readyPrompt {
-		t.Fatalf("expected KDIR lesson and ready prompt, got %v", confirmCtx.sent)
+	if len(confirmCtx.sent) != 1 || confirmCtx.sent[0] != kdirLessonMessage {
+		t.Fatalf("expected KDIR lesson with ready button, got %v", confirmCtx.sent)
 	}
-	if len(confirmCtx.sentPhotos) != 1 || confirmCtx.sentPhotos[0].FileLocal != readyPhotoPath {
-		t.Fatalf("expected ready photo, got %+v", confirmCtx.sentPhotos)
+	if len(confirmCtx.sentPhotos) != 0 {
+		t.Fatalf("pic2 must be attached to profile confirmation, not sent after the lesson: %+v", confirmCtx.sentPhotos)
 	}
 	if len(confirmCtx.sentVideos) != 1 || confirmCtx.sentVideos[0].FileLocal != kdirVideoPath || !confirmCtx.sentVideos[0].Streaming {
 		t.Fatalf("expected local streaming KDIR video, got %+v", confirmCtx.sentVideos)
+	}
+	if got := strings.Join(confirmCtx.sentEvents, ","); got != "video,text" {
+		t.Fatalf("expected video before lesson text, got event order %q", got)
 	}
 	session, _ = repo.GetActiveSession(ctx, telegramID)
 	if session.Status != db.SessionStatusKDIRLesson || session.WeakTopics != "интеграции,бд" {
@@ -1327,6 +1336,34 @@ func TestQualification_InvalidGradeDoesNotAdvanceOrCallLLM(t *testing.T) {
 	session, _ = repo.GetActiveSession(ctx, telegramID)
 	if session.CurrentGrade != "джун" || session.QualificationStep != db.QualificationStepTargetGrade {
 		t.Fatalf("valid grade should advance exactly once, got %+v", session)
+	}
+}
+
+func TestFormatQualificationSummaryCleansBulletLists(t *testing.T) {
+	session := &db.Session{
+		CurrentGrade:   "джун",
+		Grade:          "мидл",
+		StrongZones:    "- Безопасность",
+		WeakZonesInput: "- Интеграции\n- Базы данных\n- Архитектура",
+	}
+
+	got := formatQualificationSummary(session)
+	for _, want := range []string{
+		"Текущий грейд: Джун",
+		"Целевой грейд: Мидл",
+		"Сильные зоны: Безопасность",
+		"Слабые зоны: Интеграции, Базы данных, Архитектура",
+		"В первую очередь будем подтягивать: Интеграции, Базы данных, Архитектура.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("summary does not contain %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "\n-") {
+		t.Fatalf("summary still contains raw bullet newlines:\n%s", got)
+	}
+	if btnReady.Text != "Готов(а)" {
+		t.Fatalf("ready button text = %q, want %q", btnReady.Text, "Готов(а)")
 	}
 }
 

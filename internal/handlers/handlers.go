@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	tele "gopkg.in/telebot.v3"
@@ -92,7 +93,7 @@ const (
 - Архитектура
 - Требования
 - Безопасность`
-	kdirLessonMessage = `Отлично, режде чем начнём отработку - один короткий урок.
+	kdirLessonMessage = `Отлично, прежде чем начнём отработку - один короткий урок.
 
 Разбираю в нём формулу КДИР: Контекст, Действие, Инструмент, Результат.
 
@@ -103,7 +104,6 @@ const (
 Смотри урок, переходи к тренажеру, а дальше на каждом вопросе тренажёра жду от тебя ответ именно по этой структуре.
 
 Посмотри видео, потом жми «Готов(а)».`
-	readyPrompt = "Ситуация понятна. Приступим?"
 )
 
 // weakTopicsMarkerRE matches the WEAK_TOPICS: marker line the model
@@ -151,7 +151,7 @@ var (
 	btnEditProfile    = confirmationMenu.Data("Изменить ответы", "qualification_edit", "edit")
 
 	readyMenu = &tele.ReplyMarkup{}
-	btnReady  = readyMenu.Data("Готов(а), начинаем", "kdir_ready", "ready")
+	btnReady  = readyMenu.Data("Готов(а)", "kdir_ready", "ready")
 
 	vectorMenu         = &tele.ReplyMarkup{}
 	btnVectorDeepen    = vectorMenu.Data("Углубиться в тему", "question_vector", "deepen")
@@ -761,7 +761,7 @@ func (h *Handler) handleMessage(c tele.Context) error {
 	case db.SessionStatusQualification:
 		return h.handleQualification(ctx, c, student, session)
 	case db.SessionStatusProfileConfirmation:
-		return c.Send("Проверь сохранённые ответы и выбери действие кнопкой.", confirmationMenu)
+		return sendQualificationConfirmation(c, session)
 	case db.SessionStatusKDIRLesson:
 		return c.Send("Когда будешь готов, нажми кнопку.", readyMenu)
 	case db.SessionStatusAudit:
@@ -827,7 +827,7 @@ func (h *Handler) handleQualification(ctx context.Context, c tele.Context, stude
 			return c.Send(genericErrorMessage)
 		}
 		session.Status = db.SessionStatusProfileConfirmation
-		return c.Send(formatQualificationSummary(session), confirmationMenu)
+		return sendQualificationConfirmation(c, session)
 
 	case db.QualificationStepDone:
 		if err := h.repo.AdvancePhase(ctx, session.ID, db.SessionStatusProfileConfirmation); err != nil {
@@ -835,7 +835,7 @@ func (h *Handler) handleQualification(ctx context.Context, c tele.Context, stude
 			return c.Send(genericErrorMessage)
 		}
 		session.Status = db.SessionStatusProfileConfirmation
-		return c.Send(formatQualificationSummary(session), confirmationMenu)
+		return sendQualificationConfirmation(c, session)
 
 	default:
 		h.logger.Error("unexpected qualification step", "step", session.QualificationStep, "session_id", session.ID)
@@ -869,14 +869,52 @@ func gradeMenuForStep(step int) *tele.ReplyMarkup {
 }
 
 func formatQualificationSummary(session *db.Session) string {
-	return fmt.Sprintf(`Зафиксировала твои ответы, правильно ли я понимаю, что...
+	strongZones := formatProfileList(session.StrongZones)
+	weakZones := formatProfileList(session.WeakZonesInput)
+	return fmt.Sprintf(`Зафиксировала твои ответы. Правильно ли я понимаю?
 
 Текущий грейд: %s
 Целевой грейд: %s
 Сильные зоны: %s
+Слабые зоны: %s
 
-Получается, в первую очередь будем подтягивать %s для того, чтобы получить долгожданный оффер.
-Всё верно?`, session.CurrentGrade, session.Grade, session.StrongZones, session.WeakZonesInput)
+В первую очередь будем подтягивать: %s.
+Это поможет получить долгожданный оффер.
+
+Все верно?`, capitalizeFirst(session.CurrentGrade), capitalizeFirst(session.Grade), strongZones, weakZones, weakZones)
+}
+
+func formatProfileList(value string) string {
+	var items []string
+	for _, line := range strings.Split(strings.ReplaceAll(value, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimLeft(line, "-–—•* \t")
+		if line != "" {
+			items = append(items, line)
+		}
+	}
+	formatted := strings.Join(items, ", ")
+	if utf8.RuneCountInString(formatted) <= 260 {
+		return formatted
+	}
+	runes := []rune(formatted)
+	return strings.TrimSpace(string(runes[:257])) + "..."
+}
+
+func capitalizeFirst(value string) string {
+	value = strings.TrimSpace(value)
+	first, size := utf8.DecodeRuneInString(value)
+	if first == utf8.RuneError && size == 0 {
+		return value
+	}
+	return string(unicode.ToUpper(first)) + value[size:]
+}
+
+func sendQualificationConfirmation(c tele.Context, session *db.Session) error {
+	return c.Send(&tele.Photo{
+		File:    tele.FromDisk(readyPhotoPath),
+		Caption: formatQualificationSummary(session),
+	}, confirmationMenu)
 }
 
 func qualificationTopics(answer string) []string {
@@ -922,18 +960,11 @@ func (h *Handler) sendKDIRVideo(c tele.Context) error {
 }
 
 func (h *Handler) sendKDIRLesson(c tele.Context, sessionID int64) error {
-	if err := c.Send(kdirLessonMessage); err != nil {
-		return err
-	}
 	if err := h.sendKDIRVideo(c); err != nil {
 		h.logger.Error("send KDIR video", "error", err, "session_id", sessionID)
 		return c.Send(genericErrorMessage)
 	}
-	if err := sendPhoto(c, readyPhotoPath); err != nil {
-		h.logger.Error("send ready photo", "error", err, "session_id", sessionID)
-		return c.Send(genericErrorMessage)
-	}
-	return c.Send(readyPrompt, readyMenu)
+	return c.Send(kdirLessonMessage, readyMenu)
 }
 
 func (h *Handler) handleConfirmProfileCallback(c tele.Context) error {
@@ -1064,10 +1095,10 @@ func (h *Handler) resumeCurrentStep(ctx context.Context, c tele.Context, session
 		case db.QualificationStepWeakZones:
 			return c.Send(weakZonesQuestion)
 		default:
-			return c.Send(formatQualificationSummary(session), confirmationMenu)
+			return sendQualificationConfirmation(c, session)
 		}
 	case db.SessionStatusProfileConfirmation:
-		return c.Send(formatQualificationSummary(session), confirmationMenu)
+		return sendQualificationConfirmation(c, session)
 	case db.SessionStatusKDIRLesson:
 		return h.sendKDIRLesson(c, session.ID)
 	default:

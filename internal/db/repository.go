@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"strings"
@@ -43,6 +44,20 @@ var (
 	// ErrSummaryNotFound is returned when a session has not persisted its
 	// final report yet.
 	ErrSummaryNotFound = errors.New("session summary not found")
+
+	// ErrAccessCodeNotFound is returned when an admin references a code that
+	// does not exist.
+	ErrAccessCodeNotFound = errors.New("access code not found")
+
+	// ErrAccessCodeInUse prevents deleting a code already bound to a student,
+	// which would otherwise destroy referential integrity and their history.
+	ErrAccessCodeInUse = errors.New("access code is already used")
+)
+
+const (
+	accessCodePrefix    = "SA2026-"
+	accessCodeSuffixLen = 4
+	accessCodeAlphabet  = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 )
 
 // Repository provides data access for the interview bot's PostgreSQL schema.
@@ -53,6 +68,136 @@ type Repository struct {
 // NewRepository creates a Repository backed by pool.
 func NewRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
+}
+
+// CreateAccessCodes generates cryptographically random, unique registration
+// codes and stores them as unused. It is shared by the CLI and Telegram admin
+// flow so both paths use identical rules.
+func (r *Repository) CreateAccessCodes(ctx context.Context, count int) ([]string, error) {
+	if count <= 0 || count > 100 {
+		return nil, fmt.Errorf("create access codes: count must be between 1 and 100")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("create access codes begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	codes := make([]string, 0, count)
+	for len(codes) < count {
+		code, err := randomAccessCode()
+		if err != nil {
+			return nil, err
+		}
+		var inserted string
+		err = tx.QueryRow(ctx,
+			`INSERT INTO access_codes (code) VALUES ($1)
+			 ON CONFLICT (code) DO NOTHING
+			 RETURNING code`,
+			code,
+		).Scan(&inserted)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("create access code: %w", err)
+		}
+		codes = append(codes, inserted)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("create access codes commit: %w", err)
+	}
+	return codes, nil
+}
+
+func randomAccessCode() (string, error) {
+	raw := make([]byte, accessCodeSuffixLen)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate access code: %w", err)
+	}
+	suffix := make([]byte, accessCodeSuffixLen)
+	for i, b := range raw {
+		suffix[i] = accessCodeAlphabet[b&31]
+	}
+	return accessCodePrefix + string(suffix), nil
+}
+
+// DeleteUnusedAccessCode removes only an unclaimed code. Used codes stay
+// immutable because students and all their history are linked through them.
+func (r *Repository) DeleteUnusedAccessCode(ctx context.Context, code string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("delete unused access code begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var isUsed bool
+	err = tx.QueryRow(ctx, `SELECT is_used FROM access_codes WHERE code = $1 FOR UPDATE`, code).Scan(&isUsed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrAccessCodeNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("get access code for deletion: %w", err)
+	}
+	if isUsed {
+		return ErrAccessCodeInUse
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM access_codes WHERE code = $1 AND is_used = false`, code)
+	if err != nil {
+		return fmt.Errorf("delete unused access code: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrAccessCodeNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("delete unused access code commit: %w", err)
+	}
+	return nil
+}
+
+// SaveLLMUsage records the billable usage returned by one successful model
+// call. The operation identifies whether it was mini-feedback, block feedback,
+// audit or summary generation.
+func (r *Repository) SaveLLMUsage(ctx context.Context, studentID, sessionID int64, operation string, promptTokens, completionTokens, totalTokens, cachedTokens int64) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO llm_usage
+		 (student_id, session_id, operation, prompt_tokens, completion_tokens, total_tokens, cached_tokens)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		studentID, sessionID, operation, promptTokens, completionTokens, totalTokens, cachedTokens,
+	)
+	if err != nil {
+		return fmt.Errorf("save llm usage: %w", err)
+	}
+	return nil
+}
+
+// GetTokenUsageByAccessCode returns token totals for the student registered
+// with code. It also succeeds for an unused code and reports zero usage.
+func (r *Repository) GetTokenUsageByAccessCode(ctx context.Context, code string) (*TokenUsageReport, error) {
+	report := &TokenUsageReport{}
+	err := r.pool.QueryRow(ctx,
+		`SELECT ac.code, ac.is_used, ac.student_id, COALESCE(s.name, ''),
+		        COUNT(u.id), COALESCE(SUM(u.prompt_tokens), 0),
+		        COALESCE(SUM(u.completion_tokens), 0), COALESCE(SUM(u.total_tokens), 0),
+		        COALESCE(SUM(u.cached_tokens), 0)
+		 FROM access_codes ac
+		 LEFT JOIN students s ON s.telegram_id = ac.student_id
+		 LEFT JOIN llm_usage u ON u.student_id = ac.student_id
+		 WHERE ac.code = $1
+		 GROUP BY ac.code, ac.is_used, ac.student_id, s.name`,
+		code,
+	).Scan(
+		&report.Code, &report.IsUsed, &report.StudentID, &report.StudentName,
+		&report.Calls, &report.PromptTokens, &report.CompletionTokens,
+		&report.TotalTokens, &report.CachedTokens,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrAccessCodeNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get token usage by access code: %w", err)
+	}
+	return report, nil
 }
 
 // CreateStudentIfAccessCodeValid registers a student for telegramID using
@@ -421,7 +566,7 @@ func (r *Repository) PickQuestion(ctx context.Context, grade, topic string) (*Qu
 		       followup_1, followup_1_context, followup_2, followup_2_context,
 		       answer_junior, answer_middle, answer_senior, source
 		FROM question_bank
-		WHERE grade = ANY($1)`
+		WHERE active = true AND grade = ANY($1)`
 	args := []any{compatibleQuestionGrades(grade)}
 
 	if topic != "" {
@@ -455,7 +600,7 @@ func (r *Repository) PickQuestionForSession(ctx context.Context, sessionID int64
 		       q.followup_1, q.followup_1_context, q.followup_2, q.followup_2_context,
 		       q.answer_junior, q.answer_middle, q.answer_senior, q.source
 		FROM question_bank q
-		WHERE q.grade = ANY($2)
+		WHERE q.active = true AND q.grade = ANY($2)
 		  AND NOT EXISTS (
 		      SELECT 1 FROM question_attempts a
 		      WHERE a.session_id = $1 AND a.question_id = q.id

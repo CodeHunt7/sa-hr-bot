@@ -47,10 +47,10 @@ build:
 
 check: test vet build
 
-code: config-check db-start
+code: migrate
 	go run ./cmd/generate-codes -n 1
 
-questions: config-check db-start
+questions: migrate
 	go run ./cmd/import-questions -file question_bank.csv
 
 docker-db-up:

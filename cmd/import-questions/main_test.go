@@ -22,6 +22,7 @@ func TestValidateQuestionRow(t *testing.T) {
 		{name: "empty context", index: 1, value: ""},
 		{name: "unknown grade", index: 2, value: "лид"},
 		{name: "unknown topic", index: 3, value: "астрология"},
+		{name: "removed presentation topic", index: 3, value: "подача"},
 		{name: "empty followup", index: 4, value: ""},
 		{name: "empty followup context", index: 5, value: ""},
 		{name: "empty reference answer", index: 10, value: ""},

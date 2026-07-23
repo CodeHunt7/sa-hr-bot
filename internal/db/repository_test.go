@@ -2,8 +2,26 @@ package db
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
+
+func TestRandomAccessCode(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		code, err := randomAccessCode()
+		if err != nil {
+			t.Fatalf("randomAccessCode: %v", err)
+		}
+		if !strings.HasPrefix(code, accessCodePrefix) || len(code) != len(accessCodePrefix)+accessCodeSuffixLen {
+			t.Fatalf("unexpected code format: %q", code)
+		}
+		for _, char := range code[len(accessCodePrefix):] {
+			if !strings.ContainsRune(accessCodeAlphabet, char) {
+				t.Fatalf("code %q contains unsupported character %q", code, char)
+			}
+		}
+	}
+}
 
 func TestCompatibleQuestionGrades(t *testing.T) {
 	tests := []struct {

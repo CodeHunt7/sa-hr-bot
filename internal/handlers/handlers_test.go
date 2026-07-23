@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -105,6 +106,7 @@ type fakeRepo struct {
 	questions     map[int64]*db.QuestionBank
 	attempts      map[int64]*db.QuestionAttempt
 	nextAttemptID int64
+	tokenUsage    map[string]*db.TokenUsageReport
 
 	// panicOnAnyCall makes every method below panic immediately, for
 	// tests proving recoverMiddleware actually wraps a given endpoint:
@@ -126,13 +128,80 @@ func newFakeRepo(codes ...string) *fakeRepo {
 		m[c] = false
 	}
 	return &fakeRepo{
-		students:  make(map[int64]*db.Student),
-		sessions:  make(map[int64]*db.Session),
-		codes:     m,
-		weakZones: make(map[int64][]db.WeakZone),
-		questions: make(map[int64]*db.QuestionBank),
-		attempts:  make(map[int64]*db.QuestionAttempt),
+		students:   make(map[int64]*db.Student),
+		sessions:   make(map[int64]*db.Session),
+		codes:      m,
+		weakZones:  make(map[int64][]db.WeakZone),
+		questions:  make(map[int64]*db.QuestionBank),
+		attempts:   make(map[int64]*db.QuestionAttempt),
+		tokenUsage: make(map[string]*db.TokenUsageReport),
 	}
+}
+
+func (r *fakeRepo) CreateAccessCodes(_ context.Context, count int) ([]string, error) {
+	r.maybePanic()
+	if count < 1 || count > 100 {
+		return nil, errors.New("invalid count")
+	}
+	result := make([]string, 0, count)
+	for len(result) < count {
+		code := fmt.Sprintf("SA2026-A%03d", len(r.codes)+1)
+		if _, exists := r.codes[code]; exists {
+			continue
+		}
+		r.codes[code] = false
+		result = append(result, code)
+	}
+	return result, nil
+}
+
+func (r *fakeRepo) DeleteUnusedAccessCode(_ context.Context, code string) error {
+	r.maybePanic()
+	used, ok := r.codes[code]
+	if !ok {
+		return db.ErrAccessCodeNotFound
+	}
+	if used {
+		return db.ErrAccessCodeInUse
+	}
+	delete(r.codes, code)
+	return nil
+}
+
+func (r *fakeRepo) SaveLLMUsage(_ context.Context, studentID, _ int64, _ string, promptTokens, completionTokens, totalTokens, cachedTokens int64) error {
+	r.maybePanic()
+	student, ok := r.students[studentID]
+	if !ok {
+		// Some focused handler tests pass an already loaded student directly
+		// without seeding registration state. The real DB always has the FK;
+		// those tests only need usage persistence not to obscure their subject.
+		return nil
+	}
+	report := r.tokenUsage[student.AccessCode]
+	if report == nil {
+		id := student.TelegramID
+		report = &db.TokenUsageReport{Code: student.AccessCode, IsUsed: true, StudentID: &id, StudentName: student.Name}
+		r.tokenUsage[student.AccessCode] = report
+	}
+	report.Calls++
+	report.PromptTokens += promptTokens
+	report.CompletionTokens += completionTokens
+	report.TotalTokens += totalTokens
+	report.CachedTokens += cachedTokens
+	return nil
+}
+
+func (r *fakeRepo) GetTokenUsageByAccessCode(_ context.Context, code string) (*db.TokenUsageReport, error) {
+	r.maybePanic()
+	used, ok := r.codes[code]
+	if !ok {
+		return nil, db.ErrAccessCodeNotFound
+	}
+	if report := r.tokenUsage[code]; report != nil {
+		cp := *report
+		return &cp, nil
+	}
+	return &db.TokenUsageReport{Code: code, IsUsed: used}, nil
 }
 
 func (r *fakeRepo) sessionByID(id int64) (*db.Session, error) {
@@ -542,6 +611,7 @@ type fakeLLM struct {
 	followupEvalCalls int
 	blockEvalCalls    int
 	pickErr           error // if set, returned by the next PickQuestion call, then cleared
+	usage             llm.Usage
 
 	lastEvalQuestion             *db.QuestionBank
 	lastPickGrade, lastPickTopic string
@@ -550,11 +620,11 @@ type fakeLLM struct {
 
 func (f *fakeLLM) nextReply() *llm.Reply {
 	if len(f.replies) == 0 {
-		return &llm.Reply{Text: "ok"}
+		return &llm.Reply{Text: "ok", Usage: f.usage}
 	}
 	text := f.replies[0]
 	f.replies = f.replies[1:]
-	return &llm.Reply{Text: text}
+	return &llm.Reply{Text: text, Usage: f.usage}
 }
 
 func (f *fakeLLM) Reply(_ context.Context, userMessage string) (*llm.Reply, error) {
@@ -634,7 +704,7 @@ func TestFullSessionFlow(t *testing.T) {
 		AnswerJunior: "junior answer", AnswerMiddle: "middle answer", AnswerSenior: "senior answer",
 	}
 	repo.questions[question.ID] = question
-	lm := &fakeLLM{question: question}
+	lm := &fakeLLM{question: question, usage: llm.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15, CachedTokens: 3}}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := New(repo, lm, logger, 2, nil) // small cycle limit keeps the test short
 
@@ -914,6 +984,10 @@ func TestFullSessionFlow(t *testing.T) {
 	}
 	if len(repo.summaries) != 1 || repo.summaries[0].SummaryText != "Итоговый отчет" {
 		t.Fatalf("expected the summary to be saved, got %v", repo.summaries)
+	}
+	usage, err := repo.GetTokenUsageByAccessCode(ctx, "SA2026-TEST")
+	if err != nil || usage.Calls != 7 || usage.PromptTokens != 70 || usage.CompletionTokens != 35 || usage.TotalTokens != 105 || usage.CachedTokens != 21 {
+		t.Fatalf("expected every LLM call to be attributed to the access code, usage=%+v err=%v", usage, err)
 	}
 
 	returnCtx := newCtx(telegramID, "")
@@ -1289,6 +1363,66 @@ func TestReport_NonAdminSilentlyIgnored(t *testing.T) {
 	}
 	if len(ctx.sent) != 0 || len(ctx.sentDocs) != 0 {
 		t.Fatalf("expected a non-admin caller to get no reply at all, got sent=%v docs=%v", ctx.sent, ctx.sentDocs)
+	}
+}
+
+func TestAdminCodeManagementAndTokenUsage(t *testing.T) {
+	repo := newFakeRepo()
+	const adminID = int64(999)
+	h := New(repo, &fakeLLM{}, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, []int64{adminID})
+
+	nonAdmin := newCtx(123, "/code 2", "2")
+	if err := h.handleCreateCodes(nonAdmin); err != nil || len(nonAdmin.sent) != 0 {
+		t.Fatalf("non-admin command must be silent, sent=%v err=%v", nonAdmin.sent, err)
+	}
+
+	help := newCtx(adminID, "/admin")
+	if err := h.handleAdminHelp(help); err != nil || len(help.sent) != 1 || !strings.Contains(help.sent[0], "/delete_code") {
+		t.Fatalf("unexpected admin help: sent=%v err=%v", help.sent, err)
+	}
+
+	create := newCtx(adminID, "/code 2", "2")
+	if err := h.handleCreateCodes(create); err != nil {
+		t.Fatalf("create codes: %v", err)
+	}
+	if len(create.sent) != 1 || !strings.Contains(create.sent[0], "SA2026-A001") || !strings.Contains(create.sent[0], "SA2026-A002") {
+		t.Fatalf("unexpected generated codes: %v", create.sent)
+	}
+
+	unusedTokens := newCtx(adminID, "/tokens SA2026-A001", "SA2026-A001")
+	if err := h.handleTokenUsage(unusedTokens); err != nil || len(unusedTokens.sent) != 1 || !strings.Contains(unusedTokens.sent[0], "не использован") {
+		t.Fatalf("unexpected unused-code usage: sent=%v err=%v", unusedTokens.sent, err)
+	}
+
+	student, err := repo.CreateStudentIfAccessCodeValid(context.Background(), 42, "Иван", "SA2026-A001")
+	if err != nil {
+		t.Fatalf("register generated code: %v", err)
+	}
+	session, err := repo.StartSession(context.Background(), student.TelegramID)
+	if err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	if err := repo.SaveLLMUsage(context.Background(), student.TelegramID, session.ID, llmOperationPrimaryFeedback, 100, 25, 125, 80); err != nil {
+		t.Fatalf("save usage: %v", err)
+	}
+
+	usedTokens := newCtx(adminID, "/tokens SA2026-A001", "SA2026-A001")
+	if err := h.handleTokenUsage(usedTokens); err != nil {
+		t.Fatalf("get used-code tokens: %v", err)
+	}
+	for _, want := range []string{"Иван", "Вызовов модели: 1", "Входные токены: 100", "Всего токенов: 125", "Из них кэшировано: 80"} {
+		if len(usedTokens.sent) != 1 || !strings.Contains(usedTokens.sent[0], want) {
+			t.Fatalf("token report missing %q: %v", want, usedTokens.sent)
+		}
+	}
+
+	deleteUsed := newCtx(adminID, "/delete_code SA2026-A001", "SA2026-A001")
+	if err := h.handleDeleteCode(deleteUsed); err != nil || len(deleteUsed.sent) != 1 || !strings.Contains(deleteUsed.sent[0], "Удаление запрещено") {
+		t.Fatalf("used code must be protected: sent=%v err=%v", deleteUsed.sent, err)
+	}
+	deleteUnused := newCtx(adminID, "/delete_code SA2026-A002", "SA2026-A002")
+	if err := h.handleDeleteCode(deleteUnused); err != nil || len(deleteUnused.sent) != 1 || !strings.Contains(deleteUnused.sent[0], "удалён") {
+		t.Fatalf("unused code deletion failed: sent=%v err=%v", deleteUnused.sent, err)
 	}
 }
 
@@ -1871,6 +2005,9 @@ func TestRegister_AllEndpointsWrappedByRecovery(t *testing.T) {
 	}{
 		{"/start command", "/start"},
 		{"/report command", "/report"},
+		{"/code command", "/code"},
+		{"/delete_code command", "/delete_code"},
+		{"/tokens command", "/tokens"},
 		{"restart callback", &btnRestart},
 		{"continue callback", &btnContinue},
 		{"current grade callback", &btnCurrentGradeJunior},
@@ -1899,7 +2036,7 @@ func TestRegister_AllEndpointsWrappedByRecovery(t *testing.T) {
 			}
 			h.Register(bot)
 
-			ctx := newCtx(telegramID, "какой-то текст", "какой-то текст")
+			ctx := newCtx(telegramID, "какой-то текст", "1")
 
 			// The real assertion: Trigger must not propagate a panic or
 			// even a returned error. If this endpoint were registered

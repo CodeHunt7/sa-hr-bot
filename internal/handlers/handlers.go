@@ -46,6 +46,18 @@ const (
 	// to run long (verbose weak-zone text, long names) falls back to
 	// CSV too.
 	reportTextSafetyLimit = 3500
+
+	// Keep bulk code creation bounded so a mistyped Telegram command cannot
+	// flood the database or produce an oversized message.
+	maxAdminCodeBatch = 20
+)
+
+const (
+	llmOperationAudit            = "audit"
+	llmOperationPrimaryFeedback  = "primary_feedback"
+	llmOperationFollowupFeedback = "followup_feedback"
+	llmOperationBlockFeedback    = "block_feedback"
+	llmOperationSummary          = "summary"
 )
 
 const genericErrorMessage = "Что-то сломалось на моей стороне. Попробуй написать еще раз через минуту."
@@ -65,7 +77,7 @@ const (
 
 	instructionMessage = `Привет. Меня зовут Катя Желатинка, я собрала для тебя тренажёр для отработки технических собеседований системного аналитика.
 
-Это не чат-бот общего назначения. Под капотом этого ИИ-агента зашито больше 150 вопросов, которые задают на собесах в 2026 года.
+Это не чат-бот общего назначения. Под капотом этого ИИ-агента собраны 32 вопроса, которые задают на собесах в 2026 году.
 
 Формат простой: сначала 4 коротких вопроса про тебя, чтобы лучше понять твой запрос. Дальше цикл вопросов с разбором каждого ответа. Фидбек получаешь сразу, без ожидания.
 
@@ -104,7 +116,7 @@ const (
 
 Это формула и способ, который позволит отвечать на технические вопросы так, чтобы сразу был виден масштаб задачи, что сделал именно ты, каким инструментом и какой результат получил.
 
-Без формулы ответ звучит как пересказ обязанностей. Сыро и иногда запутанно. А с ней, как конкретный кейс с цифрами, который HR может корректно оценить.
+Без формулы ответ звучит как пересказ обязанностей. Сыро и иногда запутанно. А с ней, как конкретный кейс с цифрами, который интервьюер может корректно оценить.
 
 Смотри урок, переходи к тренажеру, а дальше на каждом вопросе тренажёра жду от тебя ответ именно по этой структуре.
 
@@ -134,7 +146,6 @@ var validTopics = map[string]bool{
 	"бд":           true,
 	"требования":   true,
 	"безопасность": true,
-	"подача":       true,
 }
 
 // restartMenu offers the choice shown when a student sends /start while
@@ -217,6 +228,10 @@ type Repository interface {
 	SaveSummary(ctx context.Context, sessionID int64, summaryText string) (*db.SessionSummary, error)
 	GetSummaryBySessionID(ctx context.Context, sessionID int64) (*db.SessionSummary, error)
 	GetStudentReports(ctx context.Context) ([]db.StudentReport, error)
+	CreateAccessCodes(ctx context.Context, count int) ([]string, error)
+	DeleteUnusedAccessCode(ctx context.Context, code string) error
+	SaveLLMUsage(ctx context.Context, studentID, sessionID int64, operation string, promptTokens, completionTokens, totalTokens, cachedTokens int64) error
+	GetTokenUsageByAccessCode(ctx context.Context, code string) (*db.TokenUsageReport, error)
 }
 
 // LLM is the subset of *llm.Service this package depends on.
@@ -255,7 +270,7 @@ type MediaConfig struct {
 // same value substituted into the system prompt (SESSION_CYCLE_LIMIT);
 // the handler uses its copy to show a continue-or-finish checkpoint after each
 // configured number of completed blocks. adminIDs are the Telegram user IDs
-// allowed to run /report.
+// allowed to run the protected admin commands.
 func New(repo Repository, llmService LLM, logger *slog.Logger, sessionCycleLimit int, adminIDs []int64, media ...MediaConfig) *Handler {
 	ids := make(map[int64]bool, len(adminIDs))
 	for _, id := range adminIDs {
@@ -295,6 +310,10 @@ func (h *Handler) Register(bot *tele.Bot) {
 
 	h.handle(bot, "/start", h.handleStart)
 	h.handle(bot, "/report", h.handleReport)
+	h.handle(bot, "/admin", h.handleAdminHelp)
+	h.handle(bot, "/code", h.handleCreateCodes)
+	h.handle(bot, "/delete_code", h.handleDeleteCode)
+	h.handle(bot, "/tokens", h.handleTokenUsage)
 	h.handle(bot, &btnRestart, h.handleRestartCallback)
 	h.handle(bot, &btnContinue, h.handleContinueCallback)
 	h.handle(bot, &btnCurrentGradeJunior, h.handleGradeCallback)
@@ -1167,6 +1186,9 @@ func (h *Handler) runAuditAndStartQuestion(ctx context.Context, c tele.Context, 
 		h.logger.Error("llm reply", "error", err, "session_id", session.ID, "status", session.Status)
 		return c.Send(genericErrorMessage)
 	}
+	if err := h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationAudit, reply); err != nil {
+		return c.Send(genericErrorMessage)
+	}
 
 	topics, cleaned := extractWeakTopics(reply.Text)
 	if len(topics) > 0 {
@@ -1314,7 +1336,7 @@ func formatPrimaryQuestion(question *db.QuestionBank, first bool) string {
 func formatFollowupQuestion(contextText, questionText string, number int) string {
 	contextText = strings.TrimSpace(contextText)
 	if contextText == "" {
-		contextText = "HR хочет проверить, как ты применишь ответ на практике."
+		contextText = "Интервьюер хочет проверить, как ты применишь ответ на практике."
 	}
 	return fmt.Sprintf("Теперь уточняющий вопрос %d из 2.\n\n%s\n\n%s\n\nОтвечай так же текстом по формуле КДИР.",
 		number, contextText, strings.TrimSpace(questionText))
@@ -1381,6 +1403,9 @@ func (h *Handler) evaluatePrimaryAnswer(ctx context.Context, c tele.Context, stu
 	reply, err := h.llm.Evaluate(ctx, profile, weakZones, answer, question)
 	if err != nil {
 		h.logger.Error("llm evaluate primary answer", "error", err, "session_id", session.ID, "question_id", question.ID)
+		return c.Send(genericErrorMessage)
+	}
+	if err := h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationPrimaryFeedback, reply); err != nil {
 		return c.Send(genericErrorMessage)
 	}
 
@@ -1451,6 +1476,9 @@ func (h *Handler) evaluateFollowupAnswer(ctx context.Context, c tele.Context, st
 		h.logger.Error("llm evaluate followup answer", "error", err, "attempt_id", attempt.ID)
 		return c.Send(genericErrorMessage)
 	}
+	if err := h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationFollowupFeedback, reply); err != nil {
+		return c.Send(genericErrorMessage)
+	}
 
 	followup2 := strings.TrimSpace(question.Followup2)
 	if followup2 == "" {
@@ -1511,6 +1539,9 @@ func (h *Handler) evaluateSecondFollowupAnswer(ctx context.Context, c tele.Conte
 	)
 	if err != nil {
 		h.logger.Error("llm evaluate complete block", "error", err, "attempt_id", attempt.ID)
+		return c.Send(genericErrorMessage)
+	}
+	if err := h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationBlockFeedback, reply); err != nil {
 		return c.Send(genericErrorMessage)
 	}
 
@@ -1739,6 +1770,9 @@ func (h *Handler) runSummary(ctx context.Context, c tele.Context, student *db.St
 		h.logger.Error("llm reply (summary)", "error", err, "session_id", session.ID)
 		return c.Send(genericErrorMessage)
 	}
+	if err := h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationSummary, reply); err != nil {
+		return c.Send(genericErrorMessage)
+	}
 
 	if _, err := h.repo.SaveSummary(ctx, session.ID, reply.Text); err != nil {
 		h.logger.Error("save summary", "error", err, "session_id", session.ID)
@@ -1757,13 +1791,123 @@ func (h *Handler) sendSavedSummary(ctx context.Context, c tele.Context, student 
 	return sendText(c, message)
 }
 
+func (h *Handler) saveLLMUsage(ctx context.Context, studentID, sessionID int64, operation string, reply *llm.Reply) error {
+	if reply == nil {
+		return errors.New("save llm usage: nil reply")
+	}
+	usage := reply.Usage
+	if err := h.repo.SaveLLMUsage(
+		ctx, studentID, sessionID, operation,
+		usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, usage.CachedTokens,
+	); err != nil {
+		h.logger.Error("save llm usage", "error", err, "student_id", studentID, "session_id", sessionID, "operation", operation)
+		return err
+	}
+	return nil
+}
+
+func (h *Handler) isAdmin(c tele.Context) bool {
+	return h.adminIDs[senderID(c)]
+}
+
+func (h *Handler) handleAdminHelp(c tele.Context) error {
+	if !h.isAdmin(c) {
+		return nil
+	}
+	return c.Send(`Команды администратора:
+/code [количество] — создать от 1 до 20 кодов
+/delete_code КОД — удалить неиспользованный код
+/tokens КОД — показать расход токенов пользователя
+/report — показать общий отчёт по пользователям
+
+Использованный код удалить нельзя: к нему привязаны пользователь и история тренировок.`)
+}
+
+func (h *Handler) handleCreateCodes(c tele.Context) error {
+	if !h.isAdmin(c) {
+		return nil
+	}
+	count := 1
+	if len(c.Args()) > 1 {
+		return c.Send("Формат: /code [количество от 1 до 20]")
+	}
+	if len(c.Args()) == 1 {
+		parsed, err := strconv.Atoi(strings.TrimSpace(c.Args()[0]))
+		if err != nil || parsed < 1 || parsed > maxAdminCodeBatch {
+			return c.Send("Количество должно быть целым числом от 1 до 20.")
+		}
+		count = parsed
+	}
+
+	ctx, cancel := newHandlerContext()
+	defer cancel()
+	codes, err := h.repo.CreateAccessCodes(ctx, count)
+	if err != nil {
+		h.logger.Error("admin create access codes", "error", err, "admin_id", senderID(c), "count", count)
+		return c.Send(genericErrorMessage)
+	}
+	return c.Send("Новые коды доступа:\n" + strings.Join(codes, "\n"))
+}
+
+func (h *Handler) handleDeleteCode(c tele.Context) error {
+	if !h.isAdmin(c) {
+		return nil
+	}
+	if len(c.Args()) != 1 {
+		return c.Send("Формат: /delete_code SA2026-XXXX")
+	}
+	code := strings.ToUpper(strings.TrimSpace(c.Args()[0]))
+	ctx, cancel := newHandlerContext()
+	defer cancel()
+	err := h.repo.DeleteUnusedAccessCode(ctx, code)
+	switch {
+	case errors.Is(err, db.ErrAccessCodeNotFound):
+		return c.Send("Такого кода нет.")
+	case errors.Is(err, db.ErrAccessCodeInUse):
+		return c.Send("Код уже использован. Удаление запрещено, чтобы не потерять пользователя и историю тренировок.")
+	case err != nil:
+		h.logger.Error("admin delete access code", "error", err, "admin_id", senderID(c))
+		return c.Send(genericErrorMessage)
+	default:
+		return c.Send("Код " + code + " удалён.")
+	}
+}
+
+func (h *Handler) handleTokenUsage(c tele.Context) error {
+	if !h.isAdmin(c) {
+		return nil
+	}
+	if len(c.Args()) != 1 {
+		return c.Send("Формат: /tokens SA2026-XXXX")
+	}
+	code := strings.ToUpper(strings.TrimSpace(c.Args()[0]))
+	ctx, cancel := newHandlerContext()
+	defer cancel()
+	report, err := h.repo.GetTokenUsageByAccessCode(ctx, code)
+	if errors.Is(err, db.ErrAccessCodeNotFound) {
+		return c.Send("Такого кода нет.")
+	}
+	if err != nil {
+		h.logger.Error("admin get token usage", "error", err, "admin_id", senderID(c))
+		return c.Send(genericErrorMessage)
+	}
+	if !report.IsUsed || report.StudentID == nil {
+		return c.Send(fmt.Sprintf("Код: %s\nСтатус: не использован\nРасход токенов: 0", report.Code))
+	}
+	return c.Send(fmt.Sprintf(
+		"Код: %s\nПользователь: %s\nTelegram ID: %d\nВызовов модели: %d\nВходные токены: %d\nВыходные токены: %d\nВсего токенов: %d\nИз них кэшировано: %d",
+		report.Code, report.StudentName, *report.StudentID, report.Calls,
+		report.PromptTokens, report.CompletionTokens, report.TotalTokens, report.CachedTokens,
+	))
+}
+
 // handleReport is an admin-only export of every registered student:
 // telegram_id, name, completed session count, last session date, and
 // current weak-zone map. If the caller's telegram_id is not in
 // ADMIN_IDS, the command is silently ignored: no reply at all, so a
 // non-admin poking at random commands can't even tell /report exists.
 func (h *Handler) handleReport(c tele.Context) error {
-	if !h.adminIDs[senderID(c)] {
+	if !h.isAdmin(c) {
 		return nil
 	}
 

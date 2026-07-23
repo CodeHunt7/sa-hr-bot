@@ -235,7 +235,7 @@ func BuildAuditContext(profile QualificationProfile, weakZones []db.WeakZone) st
 func BuildEvaluationContext(profile StudentProfile, weakZones []db.WeakZone, studentAnswer string, question *db.QuestionBank) string {
 	var b strings.Builder
 	b.WriteString("Текущая задача: ФАЗА 3, оцени ответ кандидата на уже заданный технический вопрос.\n")
-	b.WriteString("В этом сообщении говори в роли HR, который проводит техническое собеседование.\n")
+	b.WriteString("В этом сообщении говори в роли интервьюера, который проводит техническое собеседование.\n")
 	b.WriteString("Не повторяй инструкцию. Не начинай квалификацию. Не спрашивай грейд, направление, опыт или дату собеседования.\n")
 	b.WriteString("Даже если ответ бессмысленный, грубый или не относится к вопросу, оставайся в Фазе 3. Прямо скажи, что ответ не раскрывает тему, и кратко объясни, чего не хватило.\n")
 	b.WriteString("Верни только одну рамку `▸ ОБРАТНАЯ СВЯЗЬ`. Не задавай следующий вопрос и не начинай новую фазу: уточнение из банка вопросов отправит код.\n\n")
@@ -254,7 +254,7 @@ func (s *Service) Evaluate(ctx context.Context, profile StudentProfile, weakZone
 func BuildFollowupEvaluationContext(profile StudentProfile, weakZones []db.WeakZone, primaryAnswer, followupQuestion, followupAnswer string, question *db.QuestionBank) string {
 	var b strings.Builder
 	b.WriteString("Текущая задача: ФАЗА 3. Дай короткую обратную связь только на ответ кандидата на первый уточняющий вопрос.\n")
-	b.WriteString("В этом сообщении говори в роли HR, который проводит техническое собеседование.\n")
+	b.WriteString("В этом сообщении говори в роли интервьюера, который проводит техническое собеседование.\n")
 	b.WriteString("Не повторяй инструкцию и квалификацию. Не спрашивай грейд. Не задавай новый вопрос и не давай большой разбор блока.\n")
 	b.WriteString("Верни только одну рамку `▸ ОБРАТНАЯ СВЯЗЬ`: конкретно укажи, что ответ раскрыл и чего в нем не хватило.\n")
 	b.WriteString("Даже если один из ответов грубый или бессмысленный, оставайся в этой задаче и оцени отсутствие содержательного ответа прямо.\n\n")
@@ -279,7 +279,7 @@ func (s *Service) EvaluateFollowup(ctx context.Context, profile StudentProfile, 
 func BuildBlockEvaluationContext(profile StudentProfile, weakZones []db.WeakZone, primaryAnswer, followup1Question, followup1Answer, followup2Question, followup2Answer string, question *db.QuestionBank) string {
 	var b strings.Builder
 	b.WriteString("Текущая задача: ФАЗА 3. Кандидат ответил на основной вопрос и два уточнения. Заверши блок.\n")
-	b.WriteString("В этом сообщении говори в роли HR, который проводит техническое собеседование.\n")
+	b.WriteString("В этом сообщении говори в роли интервьюера, который проводит техническое собеседование.\n")
 	b.WriteString("Не повторяй инструкцию и квалификацию. Не спрашивай грейд и не задавай новый вопрос.\n")
 	b.WriteString("Сначала дай одну короткую рамку `▸ ОБРАТНАЯ СВЯЗЬ` только по ответу на второе уточнение.\n")
 	b.WriteString("Затем дай отдельную рамку `▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ` по всей связке из трех ответов. Обязательно используй формулу КДИР: Контекст, Действие, Инструмент, Результат. Для каждого пункта укажи, что было и чего не хватило.\n")

@@ -159,7 +159,7 @@ type WeakZone struct {
 //
 // Grade holds one of: "джун", "джун-мидл", "мидл", "мидл-сеньор", "сеньор".
 // Topic holds one of: "интеграции", "архитектура", "бд", "требования",
-// "безопасность", "подача".
+// "безопасность".
 type QuestionBank struct {
 	ID               int64  `db:"id"`
 	QuestionText     string `db:"question_text"`
@@ -193,4 +193,18 @@ type StudentReport struct {
 	CompletedSessions int
 	LastSessionAt     *time.Time // nil if the student never started a session
 	WeakZones         []WeakZone
+}
+
+// TokenUsageReport is the admin-facing aggregate for one access code. Codes
+// that have not been used yet have no student identity and zero usage.
+type TokenUsageReport struct {
+	Code             string
+	IsUsed           bool
+	StudentID        *int64
+	StudentName      string
+	Calls            int64
+	PromptTokens     int64
+	CompletionTokens int64
+	TotalTokens      int64
+	CachedTokens     int64
 }

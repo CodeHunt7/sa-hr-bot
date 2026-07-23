@@ -41,7 +41,7 @@ var allowedGrades = map[string]bool{
 
 var allowedTopics = map[string]bool{
 	"интеграции": true, "архитектура": true, "бд": true,
-	"требования": true, "безопасность": true, "подача": true,
+	"требования": true, "безопасность": true,
 }
 
 func main() {
@@ -104,6 +104,13 @@ func run() error {
 	}
 	defer tx.Rollback(ctx)
 
+	// The CSV is the source of truth for questions available to new sessions.
+	// Historical rows are retained for existing attempts, but omitted rows are
+	// made inactive so filtering the file also filters an already populated DB.
+	if _, err := tx.Exec(ctx, `UPDATE question_bank SET active = false`); err != nil {
+		return fmt.Errorf("deactivate existing question bank: %w", err)
+	}
+
 	imported := 0
 	for {
 		row, err := reader.Read()
@@ -122,8 +129,8 @@ func run() error {
 			`INSERT INTO question_bank
 			 (question_text, question_context, grade, topic,
 			  followup_1, followup_1_context, followup_2, followup_2_context,
-			  answer_junior, answer_middle, answer_senior, source)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			  answer_junior, answer_middle, answer_senior, source, active)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, true)
 			 ON CONFLICT (question_text) DO UPDATE SET
 			     question_context = EXCLUDED.question_context,
 			     grade = EXCLUDED.grade,
@@ -135,7 +142,8 @@ func run() error {
 			     answer_junior = EXCLUDED.answer_junior,
 			     answer_middle = EXCLUDED.answer_middle,
 			     answer_senior = EXCLUDED.answer_senior,
-			     source = EXCLUDED.source`,
+			     source = EXCLUDED.source,
+			     active = true`,
 			row[colIndex["question_text"]],
 			row[colIndex["question_context"]],
 			row[colIndex["grade"]],

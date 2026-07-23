@@ -27,8 +27,8 @@ type Config struct {
 	// {{SESSION_CYCLE_LIMIT}} placeholder in prompts/system_prompt.md.
 	SessionCycleLimit int
 
-	// AdminIDs are the Telegram user IDs allowed to run /report. Empty
-	// means nobody can (the command silently no-ops for everyone).
+	// AdminIDs are the Telegram user IDs allowed to manage access codes,
+	// inspect token usage and run /report. Empty disables admin commands.
 	AdminIDs []int64
 }
 

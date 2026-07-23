@@ -3,9 +3,13 @@
 package llm
 
 import (
+	"strings"
+
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 )
+
+const defaultBaseURL = "https://api.openai.com/v1/"
 
 // defaultModel is used when Config.Model is empty.
 //
@@ -42,15 +46,15 @@ type Config struct {
 	Model   string // optional, e.g. "gpt-4.1-mini"; empty uses defaultModel
 }
 
-// New creates an OpenAI client. If cfg.BaseURL is empty, the SDK falls
-// back to the OPENAI_BASE_URL environment variable and, failing that,
-// the default OpenAI endpoint.
+// New creates an OpenAI client. The base URL is always passed explicitly:
+// openai-go treats an existing but empty OPENAI_BASE_URL environment variable
+// as an override and otherwise builds invalid relative URLs such as
+// "/chat/completions". Docker Compose commonly creates exactly that empty
+// variable when an optional value is omitted.
 func New(cfg Config) *Client {
 	opts := []option.RequestOption{
 		option.WithAPIKey(cfg.APIKey),
-	}
-	if cfg.BaseURL != "" {
-		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
+		option.WithBaseURL(resolveBaseURL(cfg.BaseURL)),
 	}
 
 	model := cfg.Model
@@ -62,4 +66,11 @@ func New(cfg Config) *Client {
 		api:   openai.NewClient(opts...),
 		model: model,
 	}
+}
+
+func resolveBaseURL(configured string) string {
+	if baseURL := strings.TrimSpace(configured); baseURL != "" {
+		return baseURL
+	}
+	return defaultBaseURL
 }

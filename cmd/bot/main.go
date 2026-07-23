@@ -20,6 +20,7 @@ import (
 	"sa-hr-bot/internal/handlers"
 	"sa-hr-bot/internal/llm"
 	"sa-hr-bot/internal/migrations"
+	"sa-hr-bot/internal/questionbank"
 )
 
 const shutdownDrainTimeout = 95 * time.Second
@@ -73,6 +74,11 @@ func run(logger *slog.Logger) error {
 	})
 
 	repo := db.NewRepository(pool)
+	questionCount, err := questionbank.Sync(ctx, pool, "question_bank.csv")
+	if err != nil {
+		return err
+	}
+	logger.Info("question bank synchronized", "active_questions", questionCount)
 
 	llmService, err := llm.NewService(llmClient, repo, logger, llm.ServiceConfig{
 		PromptPath:        "prompts/system_prompt.md",

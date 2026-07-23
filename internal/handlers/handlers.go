@@ -1186,9 +1186,7 @@ func (h *Handler) runAuditAndStartQuestion(ctx context.Context, c tele.Context, 
 		h.logger.Error("llm reply", "error", err, "session_id", session.ID, "status", session.Status)
 		return c.Send(genericErrorMessage)
 	}
-	if err := h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationAudit, reply); err != nil {
-		return c.Send(genericErrorMessage)
-	}
+	h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationAudit, reply)
 
 	topics, cleaned := extractWeakTopics(reply.Text)
 	if len(topics) > 0 {
@@ -1295,6 +1293,9 @@ func (h *Handler) askNextQuestion(ctx context.Context, c tele.Context, student *
 		question, err = h.llm.PickQuestionForSession(ctx, session.ID, grade, "")
 	}
 	if errors.Is(err, db.ErrNoMatchingQuestion) {
+		h.logger.Warn("no unused matching question",
+			"session_id", session.ID, "student_id", student.TelegramID,
+			"target_grade", grade, "preferred_topic", topic)
 		if sendErr := c.Send("Подходящие вопросы в банке закончились. Завершаю тренировку и собираю итог."); sendErr != nil {
 			return sendErr
 		}
@@ -1405,9 +1406,7 @@ func (h *Handler) evaluatePrimaryAnswer(ctx context.Context, c tele.Context, stu
 		h.logger.Error("llm evaluate primary answer", "error", err, "session_id", session.ID, "question_id", question.ID)
 		return c.Send(genericErrorMessage)
 	}
-	if err := h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationPrimaryFeedback, reply); err != nil {
-		return c.Send(genericErrorMessage)
-	}
+	h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationPrimaryFeedback, reply)
 
 	followup := question.Followup1
 	followupContext := question.Followup1Context
@@ -1476,9 +1475,7 @@ func (h *Handler) evaluateFollowupAnswer(ctx context.Context, c tele.Context, st
 		h.logger.Error("llm evaluate followup answer", "error", err, "attempt_id", attempt.ID)
 		return c.Send(genericErrorMessage)
 	}
-	if err := h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationFollowupFeedback, reply); err != nil {
-		return c.Send(genericErrorMessage)
-	}
+	h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationFollowupFeedback, reply)
 
 	followup2 := strings.TrimSpace(question.Followup2)
 	if followup2 == "" {
@@ -1541,9 +1538,7 @@ func (h *Handler) evaluateSecondFollowupAnswer(ctx context.Context, c tele.Conte
 		h.logger.Error("llm evaluate complete block", "error", err, "attempt_id", attempt.ID)
 		return c.Send(genericErrorMessage)
 	}
-	if err := h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationBlockFeedback, reply); err != nil {
-		return c.Send(genericErrorMessage)
-	}
+	h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationBlockFeedback, reply)
 
 	zoneStatus, cleaned := extractWeakZoneStatus(reply.Text)
 	if zoneStatus == "" {
@@ -1768,11 +1763,10 @@ func (h *Handler) runSummary(ctx context.Context, c tele.Context, student *db.St
 	reply, err := h.llm.Reply(ctx, llm.BuildSummaryContext(profile, weakZones, attempts))
 	if err != nil {
 		h.logger.Error("llm reply (summary)", "error", err, "session_id", session.ID)
-		return c.Send(genericErrorMessage)
+		return h.sendSavedSummary(ctx, c, student, session,
+			"Не получилось сформировать подробный итог из-за временной ошибки. Твои ответы и прогресс сохранены. Попробуй завершить тренировку ещё раз позже.")
 	}
-	if err := h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationSummary, reply); err != nil {
-		return c.Send(genericErrorMessage)
-	}
+	h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationSummary, reply)
 
 	if _, err := h.repo.SaveSummary(ctx, session.ID, reply.Text); err != nil {
 		h.logger.Error("save summary", "error", err, "session_id", session.ID)
@@ -1791,9 +1785,10 @@ func (h *Handler) sendSavedSummary(ctx context.Context, c tele.Context, student 
 	return sendText(c, message)
 }
 
-func (h *Handler) saveLLMUsage(ctx context.Context, studentID, sessionID int64, operation string, reply *llm.Reply) error {
+func (h *Handler) saveLLMUsage(ctx context.Context, studentID, sessionID int64, operation string, reply *llm.Reply) {
 	if reply == nil {
-		return errors.New("save llm usage: nil reply")
+		h.logger.Error("save llm usage", "error", "nil reply", "student_id", studentID, "session_id", sessionID, "operation", operation)
+		return
 	}
 	usage := reply.Usage
 	if err := h.repo.SaveLLMUsage(
@@ -1801,9 +1796,7 @@ func (h *Handler) saveLLMUsage(ctx context.Context, studentID, sessionID int64, 
 		usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, usage.CachedTokens,
 	); err != nil {
 		h.logger.Error("save llm usage", "error", err, "student_id", studentID, "session_id", sessionID, "operation", operation)
-		return err
 	}
-	return nil
 }
 
 func (h *Handler) isAdmin(c tele.Context) bool {

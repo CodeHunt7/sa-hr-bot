@@ -200,6 +200,44 @@ func (r *Repository) GetTokenUsageByAccessCode(ctx context.Context, code string)
 	return report, nil
 }
 
+// ListAccessCodes returns every issued code, its occupancy and aggregate LLM
+// usage. Unused codes are listed first so an administrator can quickly copy
+// one without scanning through registered users.
+func (r *Repository) ListAccessCodes(ctx context.Context) ([]TokenUsageReport, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT ac.code, ac.is_used, ac.student_id, COALESCE(s.name, ''),
+		        COUNT(u.id), COALESCE(SUM(u.prompt_tokens), 0),
+		        COALESCE(SUM(u.completion_tokens), 0), COALESCE(SUM(u.total_tokens), 0),
+		        COALESCE(SUM(u.cached_tokens), 0)
+		 FROM access_codes ac
+		 LEFT JOIN students s ON s.telegram_id = ac.student_id
+		 LEFT JOIN llm_usage u ON u.student_id = ac.student_id
+		 GROUP BY ac.code, ac.is_used, ac.student_id, s.name
+		 ORDER BY ac.is_used, ac.code`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list access codes: %w", err)
+	}
+	defer rows.Close()
+
+	var reports []TokenUsageReport
+	for rows.Next() {
+		var report TokenUsageReport
+		if err := rows.Scan(
+			&report.Code, &report.IsUsed, &report.StudentID, &report.StudentName,
+			&report.Calls, &report.PromptTokens, &report.CompletionTokens,
+			&report.TotalTokens, &report.CachedTokens,
+		); err != nil {
+			return nil, fmt.Errorf("scan access code report: %w", err)
+		}
+		reports = append(reports, report)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate access code reports: %w", err)
+	}
+	return reports, nil
+}
+
 // CreateStudentIfAccessCodeValid registers a student for telegramID using
 // code. The access_codes row is locked for the duration of the
 // transaction so two concurrent registrations racing on the same code
@@ -1007,18 +1045,32 @@ func (r *Repository) GetSessionAttemptReports(ctx context.Context, sessionID int
 	return reports, nil
 }
 
-// GetStudentReports returns an activity summary for every registered
-// student (completed session count, last session date, current
-// weak-zone map), ordered by telegram_id. Used by the admin /report
-// command.
+// GetStudentReports returns activity and token usage for every registered
+// student, ordered by telegram_id. Used by the admin /report command.
 func (r *Repository) GetStudentReports(ctx context.Context) ([]StudentReport, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT s.telegram_id, s.name,
-		        COUNT(sess.id) FILTER (WHERE sess.status = $1) AS completed_sessions,
-		        MAX(sess.started_at) AS last_session_at
+		`SELECT s.telegram_id, s.name, s.access_code,
+		        COALESCE(sess.completed_sessions, 0), sess.last_session_at,
+		        COALESCE(usage.calls, 0), COALESCE(usage.prompt_tokens, 0),
+		        COALESCE(usage.completion_tokens, 0), COALESCE(usage.total_tokens, 0),
+		        COALESCE(usage.cached_tokens, 0)
 		 FROM students s
-		 LEFT JOIN sessions sess ON sess.student_id = s.telegram_id
-		 GROUP BY s.telegram_id, s.name
+		 LEFT JOIN (
+		     SELECT student_id,
+		            COUNT(*) FILTER (WHERE status = $1) AS completed_sessions,
+		            MAX(started_at) AS last_session_at
+		     FROM sessions
+		     GROUP BY student_id
+		 ) sess ON sess.student_id = s.telegram_id
+		 LEFT JOIN (
+		     SELECT student_id, COUNT(*) AS calls,
+		            SUM(prompt_tokens) AS prompt_tokens,
+		            SUM(completion_tokens) AS completion_tokens,
+		            SUM(total_tokens) AS total_tokens,
+		            SUM(cached_tokens) AS cached_tokens
+		     FROM llm_usage
+		     GROUP BY student_id
+		 ) usage ON usage.student_id = s.telegram_id
 		 ORDER BY s.telegram_id`,
 		SessionStatusCompleted,
 	)
@@ -1029,7 +1081,11 @@ func (r *Repository) GetStudentReports(ctx context.Context) ([]StudentReport, er
 	var reports []StudentReport
 	for rows.Next() {
 		var rep StudentReport
-		if err := rows.Scan(&rep.TelegramID, &rep.Name, &rep.CompletedSessions, &rep.LastSessionAt); err != nil {
+		if err := rows.Scan(
+			&rep.TelegramID, &rep.Name, &rep.AccessCode,
+			&rep.CompletedSessions, &rep.LastSessionAt, &rep.Calls,
+			&rep.PromptTokens, &rep.CompletionTokens, &rep.TotalTokens, &rep.CachedTokens,
+		); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan student report: %w", err)
 		}
@@ -1039,44 +1095,7 @@ func (r *Repository) GetStudentReports(ctx context.Context) ([]StudentReport, er
 		return nil, fmt.Errorf("iterate student reports: %w", err)
 	}
 	rows.Close()
-
-	weakZonesByStudent, err := r.getAllWeakZones(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for i := range reports {
-		reports[i].WeakZones = weakZonesByStudent[reports[i].TelegramID]
-	}
-
 	return reports, nil
-}
-
-// getAllWeakZones returns every weak zone grouped by student_id (most
-// recently updated first within each student), for GetStudentReports.
-func (r *Repository) getAllWeakZones(ctx context.Context) (map[int64][]WeakZone, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT id, student_id, zone_text, status, updated_at
-		 FROM weak_zones
-		 ORDER BY student_id, updated_at DESC`,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("get all weak zones: %w", err)
-	}
-	defer rows.Close()
-
-	result := make(map[int64][]WeakZone)
-	for rows.Next() {
-		var wz WeakZone
-		if err := rows.Scan(&wz.ID, &wz.StudentID, &wz.ZoneText, &wz.Status, &wz.UpdatedAt); err != nil {
-			return nil, fmt.Errorf("scan weak zone: %w", err)
-		}
-		result[wz.StudentID] = append(result[wz.StudentID], wz)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate weak zones: %w", err)
-	}
-
-	return result, nil
 }
 
 // SaveSummary stores the LLM-generated summary for a finished session.

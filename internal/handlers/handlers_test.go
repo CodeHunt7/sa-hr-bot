@@ -204,6 +204,34 @@ func (r *fakeRepo) GetTokenUsageByAccessCode(_ context.Context, code string) (*d
 	return &db.TokenUsageReport{Code: code, IsUsed: used}, nil
 }
 
+func (r *fakeRepo) ListAccessCodes(_ context.Context) ([]db.TokenUsageReport, error) {
+	r.maybePanic()
+	reports := make([]db.TokenUsageReport, 0, len(r.codes))
+	for code, used := range r.codes {
+		report := db.TokenUsageReport{Code: code, IsUsed: used}
+		if saved := r.tokenUsage[code]; saved != nil {
+			report = *saved
+		} else if used {
+			for _, student := range r.students {
+				if student.AccessCode == code {
+					id := student.TelegramID
+					report.StudentID = &id
+					report.StudentName = student.Name
+					break
+				}
+			}
+		}
+		reports = append(reports, report)
+	}
+	sort.Slice(reports, func(i, j int) bool {
+		if reports[i].IsUsed != reports[j].IsUsed {
+			return !reports[i].IsUsed
+		}
+		return reports[i].Code < reports[j].Code
+	})
+	return reports, nil
+}
+
 func (r *fakeRepo) sessionByID(id int64) (*db.Session, error) {
 	s, ok := r.sessions[id]
 	if !ok {
@@ -573,14 +601,13 @@ func (r *fakeRepo) GetSummaryBySessionID(_ context.Context, sessionID int64) (*d
 	return nil, db.ErrSummaryNotFound
 }
 
-// GetStudentReports derives the same aggregate the real repository
-// computes in SQL (completed session count, last session date, current
-// weak-zone map), from the fake's in-memory state.
+// GetStudentReports derives the same activity and token aggregate the real
+// repository computes in SQL, from the fake's in-memory state.
 func (r *fakeRepo) GetStudentReports(_ context.Context) ([]db.StudentReport, error) {
 	r.maybePanic()
 	reports := make([]db.StudentReport, 0, len(r.students))
 	for id, s := range r.students {
-		rep := db.StudentReport{TelegramID: id, Name: s.Name, WeakZones: r.weakZones[id]}
+		rep := db.StudentReport{TelegramID: id, Name: s.Name, AccessCode: s.AccessCode}
 		var last *time.Time
 		for _, sess := range r.sessions {
 			if sess.StudentID != id {
@@ -595,6 +622,13 @@ func (r *fakeRepo) GetStudentReports(_ context.Context) ([]db.StudentReport, err
 			}
 		}
 		rep.LastSessionAt = last
+		if usage := r.tokenUsage[s.AccessCode]; usage != nil {
+			rep.Calls = usage.Calls
+			rep.PromptTokens = usage.PromptTokens
+			rep.CompletionTokens = usage.CompletionTokens
+			rep.TotalTokens = usage.TotalTokens
+			rep.CachedTokens = usage.CachedTokens
+		}
 		reports = append(reports, rep)
 	}
 	sort.Slice(reports, func(i, j int) bool { return reports[i].TelegramID < reports[j].TelegramID })
@@ -1337,7 +1371,9 @@ func TestSplitTelegramText(t *testing.T) {
 // session and weak zones, directly into the fake so /report tests don't
 // have to run a full registration + FSM flow per student.
 func seedStudentWithReport(repo *fakeRepo, telegramID int64, name string, completedSessions int, lastSessionAt time.Time, zones ...db.WeakZone) {
-	repo.students[telegramID] = &db.Student{TelegramID: telegramID, Name: name, CreatedAt: lastSessionAt}
+	code := fmt.Sprintf("SA2026-R%03d", telegramID)
+	repo.codes[code] = true
+	repo.students[telegramID] = &db.Student{TelegramID: telegramID, Name: name, AccessCode: code, CreatedAt: lastSessionAt}
 	for i := 0; i < completedSessions; i++ {
 		repo.nextID++
 		repo.sessions[repo.nextID] = &db.Session{
@@ -1416,6 +1452,16 @@ func TestAdminCodeManagementAndTokenUsage(t *testing.T) {
 		}
 	}
 
+	listCodes := newCtx(adminID, "/codes")
+	if err := h.handleListCodes(listCodes); err != nil {
+		t.Fatalf("list codes: %v", err)
+	}
+	for _, want := range []string{"SA2026-A001 — занят", "Иван, Telegram ID: 42", "Токены: 125", "SA2026-A002 — свободен"} {
+		if len(listCodes.sent) != 1 || !strings.Contains(listCodes.sent[0], want) {
+			t.Fatalf("code list missing %q: %v", want, listCodes.sent)
+		}
+	}
+
 	deleteUsed := newCtx(adminID, "/delete_code SA2026-A001", "SA2026-A001")
 	if err := h.handleDeleteCode(deleteUsed); err != nil || len(deleteUsed.sent) != 1 || !strings.Contains(deleteUsed.sent[0], "Удаление запрещено") {
 		t.Fatalf("used code must be protected: sent=%v err=%v", deleteUsed.sent, err)
@@ -1453,7 +1499,7 @@ func TestReport_AdminSmallListSendsText(t *testing.T) {
 	text := ctx.sent[0]
 	for _, want := range []string{
 		"telegram_id: 1", "Иван Иванов", "Завершенных сессий: 2",
-		"интеграции (confirmed)", "требования (hypothesis)",
+		"Код: SA2026-R001", "Токены: 0",
 		"telegram_id: 2", "Мария Петрова", "Завершенных сессий: 0",
 	} {
 		if !strings.Contains(text, want) {
@@ -1498,12 +1544,15 @@ func TestReport_AdminLargeListSendsCSV(t *testing.T) {
 	if len(records) != studentCount+1 {
 		t.Fatalf("expected %d rows (header + %d students), got %d", studentCount+1, studentCount, len(records))
 	}
-	wantHeader := []string{"telegram_id", "name", "completed_sessions", "last_session_at", "weak_zones"}
+	wantHeader := []string{
+		"telegram_id", "name", "access_code", "completed_sessions", "last_session_at",
+		"llm_calls", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens",
+	}
 	if strings.Join(records[0], ",") != strings.Join(wantHeader, ",") {
 		t.Fatalf("unexpected csv header: %v", records[0])
 	}
-	if !strings.Contains(records[1][4], "бд (hypothesis)") {
-		t.Fatalf("expected weak zones column to be populated, got %q", records[1][4])
+	if records[1][2] == "" {
+		t.Fatalf("expected access code in CSV, got %v", records[1])
 	}
 }
 
@@ -2006,6 +2055,7 @@ func TestRegister_AllEndpointsWrappedByRecovery(t *testing.T) {
 		{"/start command", "/start"},
 		{"/report command", "/report"},
 		{"/code command", "/code"},
+		{"/codes command", "/codes"},
 		{"/delete_code command", "/delete_code"},
 		{"/tokens command", "/tokens"},
 		{"restart callback", &btnRestart},

@@ -184,15 +184,19 @@ type SessionSummary struct {
 	CreatedAt   time.Time `db:"created_at"`
 }
 
-// StudentReport is a per-student activity summary aggregated across
-// students, sessions and weak_zones for the admin /report command. It
-// is a read model, not a table row.
+// StudentReport is a per-student activity and LLM usage summary for the
+// admin /report command. It is a read model, not a table row.
 type StudentReport struct {
 	TelegramID        int64
 	Name              string
+	AccessCode        string
 	CompletedSessions int
 	LastSessionAt     *time.Time // nil if the student never started a session
-	WeakZones         []WeakZone
+	Calls             int64
+	PromptTokens      int64
+	CompletionTokens  int64
+	TotalTokens       int64
+	CachedTokens      int64
 }
 
 // TokenUsageReport is the admin-facing aggregate for one access code. Codes

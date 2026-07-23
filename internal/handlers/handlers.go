@@ -229,6 +229,7 @@ type Repository interface {
 	GetSummaryBySessionID(ctx context.Context, sessionID int64) (*db.SessionSummary, error)
 	GetStudentReports(ctx context.Context) ([]db.StudentReport, error)
 	CreateAccessCodes(ctx context.Context, count int) ([]string, error)
+	ListAccessCodes(ctx context.Context) ([]db.TokenUsageReport, error)
 	DeleteUnusedAccessCode(ctx context.Context, code string) error
 	SaveLLMUsage(ctx context.Context, studentID, sessionID int64, operation string, promptTokens, completionTokens, totalTokens, cachedTokens int64) error
 	GetTokenUsageByAccessCode(ctx context.Context, code string) (*db.TokenUsageReport, error)
@@ -312,6 +313,7 @@ func (h *Handler) Register(bot *tele.Bot) {
 	h.handle(bot, "/report", h.handleReport)
 	h.handle(bot, "/admin", h.handleAdminHelp)
 	h.handle(bot, "/code", h.handleCreateCodes)
+	h.handle(bot, "/codes", h.handleListCodes)
 	h.handle(bot, "/delete_code", h.handleDeleteCode)
 	h.handle(bot, "/tokens", h.handleTokenUsage)
 	h.handle(bot, &btnRestart, h.handleRestartCallback)
@@ -1809,9 +1811,10 @@ func (h *Handler) handleAdminHelp(c tele.Context) error {
 	}
 	return c.Send(`Команды администратора:
 /code [количество] — создать от 1 до 20 кодов
+/codes — показать все свободные и занятые коды
 /delete_code КОД — удалить неиспользованный код
 /tokens КОД — показать расход токенов пользователя
-/report — показать общий отчёт по пользователям
+/report — показать пользователей, их коды и расход токенов
 
 Использованный код удалить нельзя: к нему привязаны пользователь и история тренировок.`)
 }
@@ -1840,6 +1843,38 @@ func (h *Handler) handleCreateCodes(c tele.Context) error {
 		return c.Send(genericErrorMessage)
 	}
 	return c.Send("Новые коды доступа:\n" + strings.Join(codes, "\n"))
+}
+
+func (h *Handler) handleListCodes(c tele.Context) error {
+	if !h.isAdmin(c) {
+		return nil
+	}
+	ctx, cancel := newHandlerContext()
+	defer cancel()
+	reports, err := h.repo.ListAccessCodes(ctx)
+	if err != nil {
+		h.logger.Error("admin list access codes", "error", err, "admin_id", senderID(c))
+		return c.Send(genericErrorMessage)
+	}
+	if len(reports) == 0 {
+		return c.Send("Кодов доступа пока нет. Создать: /code [количество]")
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Все коды доступа: %d\n\n", len(reports))
+	for i, report := range reports {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		if !report.IsUsed || report.StudentID == nil {
+			fmt.Fprintf(&b, "%s — свободен\n", report.Code)
+			continue
+		}
+		fmt.Fprintf(&b, "%s — занят\n", report.Code)
+		fmt.Fprintf(&b, "%s, Telegram ID: %d\n", report.StudentName, *report.StudentID)
+		fmt.Fprintf(&b, "Токены: %d\n", report.TotalTokens)
+	}
+	return sendText(c, b.String())
 }
 
 func (h *Handler) handleDeleteCode(c tele.Context) error {
@@ -1895,8 +1930,8 @@ func (h *Handler) handleTokenUsage(c tele.Context) error {
 }
 
 // handleReport is an admin-only export of every registered student:
-// telegram_id, name, completed session count, last session date, and
-// current weak-zone map. If the caller's telegram_id is not in
+// access code, telegram_id, activity and aggregate token usage. If the
+// caller's telegram_id is not in
 // ADMIN_IDS, the command is silently ignored: no reply at all, so a
 // non-admin poking at random commands can't even tell /report exists.
 func (h *Handler) handleReport(c tele.Context) error {
@@ -1945,9 +1980,11 @@ func formatReportText(reports []db.StudentReport) string {
 		}
 		fmt.Fprintf(&b, "telegram_id: %d\n", rep.TelegramID)
 		fmt.Fprintf(&b, "Имя: %s\n", rep.Name)
+		fmt.Fprintf(&b, "Код: %s\n", rep.AccessCode)
 		fmt.Fprintf(&b, "Завершенных сессий: %d\n", rep.CompletedSessions)
 		fmt.Fprintf(&b, "Последняя сессия: %s\n", formatReportDate(rep.LastSessionAt))
-		fmt.Fprintf(&b, "Слабые зоны: %s\n", formatWeakZones(rep.WeakZones))
+		fmt.Fprintf(&b, "Токены: %d (вход: %d, выход: %d, кэш: %d; вызовов: %d)\n",
+			rep.TotalTokens, rep.PromptTokens, rep.CompletionTokens, rep.CachedTokens, rep.Calls)
 	}
 	return b.String()
 }
@@ -1962,16 +1999,24 @@ func writeReportCSV(reports []db.StudentReport) (string, error) {
 	defer f.Close()
 
 	w := csv.NewWriter(f)
-	if err := w.Write([]string{"telegram_id", "name", "completed_sessions", "last_session_at", "weak_zones"}); err != nil {
+	if err := w.Write([]string{
+		"telegram_id", "name", "access_code", "completed_sessions", "last_session_at",
+		"llm_calls", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens",
+	}); err != nil {
 		return "", fmt.Errorf("write csv header: %w", err)
 	}
 	for _, rep := range reports {
 		row := []string{
 			strconv.FormatInt(rep.TelegramID, 10),
 			rep.Name,
+			rep.AccessCode,
 			strconv.Itoa(rep.CompletedSessions),
 			formatReportDate(rep.LastSessionAt),
-			formatWeakZones(rep.WeakZones),
+			strconv.FormatInt(rep.Calls, 10),
+			strconv.FormatInt(rep.PromptTokens, 10),
+			strconv.FormatInt(rep.CompletionTokens, 10),
+			strconv.FormatInt(rep.TotalTokens, 10),
+			strconv.FormatInt(rep.CachedTokens, 10),
 		}
 		if err := w.Write(row); err != nil {
 			return "", fmt.Errorf("write csv row: %w", err)
@@ -1992,19 +2037,6 @@ func formatReportDate(t *time.Time) string {
 		return "нет"
 	}
 	return t.Format("2006-01-02 15:04")
-}
-
-// formatWeakZones renders a student's weak-zone map as "text (status)"
-// pairs for both the text and CSV report formats.
-func formatWeakZones(zones []db.WeakZone) string {
-	if len(zones) == 0 {
-		return "нет"
-	}
-	parts := make([]string, len(zones))
-	for i, z := range zones {
-		parts[i] = fmt.Sprintf("%s (%s)", z.ZoneText, z.Status)
-	}
-	return strings.Join(parts, "; ")
 }
 
 // extractWeakTopics pulls the WEAK_TOPICS: marker line (see

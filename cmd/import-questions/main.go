@@ -1,4 +1,4 @@
-// Command import-questions synchronizes question_bank.csv with PostgreSQL.
+// Command import-questions synchronizes materials/question_bank.csv with PostgreSQL.
 package main
 
 import (
@@ -22,7 +22,7 @@ func main() {
 }
 
 func run() error {
-	csvPath := flag.String("file", "question_bank.csv", "path to the question bank CSV file")
+	csvPath := flag.String("file", "materials/question_bank.csv", "path to the question bank CSV file")
 	flag.Parse()
 
 	_ = godotenv.Load()

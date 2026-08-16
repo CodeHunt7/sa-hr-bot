@@ -14,5 +14,6 @@ coverage
 *.log
 *.out
 *.test
-work-todo.md
-how-to-test.md
+materials/*.md
+materials/*.pdf
+materials/question_bank_*.csv

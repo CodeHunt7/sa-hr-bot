@@ -23,7 +23,7 @@ RUN apk add --no-cache ca-certificates \
 COPY --from=build /out/bot /usr/local/bin/bot
 COPY prompts /app/prompts
 COPY media /app/media
-COPY question_bank.csv /app/question_bank.csv
+COPY materials/question_bank.csv /app/materials/question_bank.csv
 
 WORKDIR /app
 USER app

@@ -74,7 +74,7 @@ func run(logger *slog.Logger) error {
 	})
 
 	repo := db.NewRepository(pool)
-	questionCount, err := questionbank.Sync(ctx, pool, "question_bank.csv")
+	questionCount, err := questionbank.Sync(ctx, pool, "materials/question_bank.csv")
 	if err != nil {
 		return err
 	}

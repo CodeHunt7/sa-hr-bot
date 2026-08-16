@@ -51,7 +51,7 @@ code: migrate
 	go run ./cmd/generate-codes -n 1
 
 questions: migrate
-	go run ./cmd/import-questions -file question_bank.csv
+	go run ./cmd/import-questions -file materials/question_bank.csv
 
 docker-db-up:
 	docker compose up -d --wait postgres

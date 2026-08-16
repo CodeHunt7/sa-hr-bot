@@ -89,23 +89,9 @@ make code        # создать один код доступа
 
 ## Запуск на VPS
 
-Для текущей production-схемы нужны:
-
-- Linux-сервер с Git, Docker и Docker Compose;
-- каталог `/opt/sa-hr-bot`;
-- серверные файлы `compose.prod.yaml` и `prod.env`.
-
-`prod.env` должен содержать как минимум:
-
-```dotenv
-TELEGRAM_BOT_TOKEN=...
-OPENAI_API_KEY=...
-DATABASE_URL=postgres://...
-ADMIN_IDS=123456789
-SESSION_CYCLE_LIMIT=8
-```
-
-Секреты, настоящий IP сервера, `prod.env` и пароли нельзя сохранять в Git.
+Нужен Linux-сервер с Git, Docker и Docker Compose. PostgreSQL отдельно через
+`apt` устанавливать не надо: Compose сам скачает `postgres:16-alpine`, создаст
+базу и сохранит её в Docker volume.
 
 ### Первый запуск
 
@@ -115,13 +101,48 @@ cd /opt
 git clone https://github.com/CodeHunt7/sa-hr-bot.git
 cd sa-hr-bot
 
-# Добавить на сервер compose.prod.yaml и prod.env
+cp compose.prod.example.yaml compose.prod.yaml
+cp prod.env.example prod.env
+openssl rand -hex 24
+nano prod.env
+```
+
+Последняя команда перед `nano` напечатает безопасный пароль. В `prod.env` один
+и тот же пароль нужно поставить в `POSTGRES_PASSWORD` и в `DATABASE_URL`:
+
+```dotenv
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=СГЕНЕРИРОВАННЫЙ_ПАРОЛЬ
+POSTGRES_DB=sahrbot
+
+DATABASE_URL=postgres://postgres:СГЕНЕРИРОВАННЫЙ_ПАРОЛЬ@postgres:5432/sahrbot?sslmode=disable
+
+TELEGRAM_BOT_TOKEN=...
+OPENAI_API_KEY=...
+ADMIN_IDS=123456789
+SESSION_CYCLE_LIMIT=8
+```
+
+Внутри Docker-сети хост называется `postgres` — это имя сервиса в
+`compose.prod.yaml`. `localhost` здесь использовать нельзя: внутри контейнера
+бота он указывал бы на сам контейнер бота, а не на базу.
+
+Поднять PostgreSQL, проверить его и запустить бота:
+
+```bash
+docker compose -f compose.prod.yaml up -d --wait postgres
+docker compose -f compose.prod.yaml exec postgres \
+  pg_isready -U postgres -d sahrbot
 docker compose -f compose.prod.yaml up -d --build bot
 docker compose -f compose.prod.yaml logs --tail=100 bot
 ```
 
-Запуск успешен, если в логах есть `question bank synchronized`, затем
-`bot starting`, а контейнер не завершается с ошибкой.
+`pg_isready` должен вывести `accepting connections`. Запуск бота успешен, если
+в логах есть `question bank synchronized`, затем `bot starting`. База и
+пользователь создаются автоматически только при первом запуске пустого volume;
+после этого данные сохраняются между обновлениями контейнеров.
+
+Секреты, настоящий IP сервера, `prod.env` и пароли нельзя сохранять в Git.
 
 ### Обновить бота после изменений в `main`
 

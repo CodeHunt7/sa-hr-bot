@@ -5,6 +5,7 @@
 *.env.*
 !.env.example
 !*.env.example
+/compose.prod.yaml
 
 # Go build and test artifacts
 /bot

@@ -77,7 +77,7 @@ const (
 
 	instructionMessage = `Привет. Меня зовут Катя Желатинка, я собрала для тебя тренажёр для отработки технических собеседований системного аналитика.
 
-Это не чат-бот общего назначения. Под капотом этого ИИ-агента собраны 80 вопросов, которые задают на собесах в 2026 году.
+Это не чат-бот общего назначения. Под капотом этого ИИ-агента собраны 58 вопросов, которые задают на собесах в 2026 году.
 
 Формат простой: сначала 4 коротких вопроса про тебя, чтобы лучше понять твой запрос. Дальше цикл вопросов с разбором каждого ответа. Фидбек получаешь сразу, без ожидания.
 
@@ -114,11 +114,11 @@ const (
 
 Разбираю в нём формулу КДИР: Контекст, Действие, Инструмент, Результат.
 
-Это формула и способ, который позволит отвечать на технические вопросы так, чтобы сразу был виден масштаб задачи, что сделал именно ты, каким инструментом и какой результат получил.
+Это удобная подсказка для структуры ответа. Она помогает показать масштаб задачи, твои действия, использованные инструменты и результат.
 
-Без формулы ответ звучит как пересказ обязанностей. Сыро и иногда запутанно. А с ней, как конкретный кейс с цифрами, который интервьюер может корректно оценить.
+Не обязательно укладывать каждый ответ в КДИР дословно. Если ответ по смыслу верный и аргументированный, я это учту. Если структуры будет не хватать, я коротко напомню про формулу.
 
-Смотри урок, переходи к тренажеру, а дальше на каждом вопросе тренажёра жду от тебя ответ именно по этой структуре.
+Посмотри урок и попробуй использовать КДИР там, где она помогает яснее донести мысль.
 
 Посмотри видео, потом жми «Готов(а)».`
 )
@@ -146,6 +146,7 @@ var validTopics = map[string]bool{
 	"бд":           true,
 	"требования":   true,
 	"безопасность": true,
+	"soft-skills":  true,
 }
 
 // restartMenu offers the choice shown when a student sends /start while
@@ -160,7 +161,9 @@ var (
 	btnCurrentGradeMiddle = currentGradeMenu.Data("Мидл", "qualification_current_grade", "мидл")
 	btnCurrentGradeSenior = currentGradeMenu.Data("Сеньор", "qualification_current_grade", "сеньор")
 
-	targetGradeMenu      = &tele.ReplyMarkup{}
+	targetGradeMenu = &tele.ReplyMarkup{}
+	// Kept registered for buttons sent by the previous release, but no longer
+	// shown in the target-grade menu. A stale "Джун" target choice is rejected.
 	btnTargetGradeJunior = targetGradeMenu.Data("Джун", "qualification_target_grade", "джун")
 	btnTargetGradeMiddle = targetGradeMenu.Data("Мидл", "qualification_target_grade", "мидл")
 	btnTargetGradeSenior = targetGradeMenu.Data("Сеньор", "qualification_target_grade", "сеньор")
@@ -185,7 +188,7 @@ var (
 func init() {
 	restartMenu.Inline(restartMenu.Row(btnRestart, btnContinue))
 	currentGradeMenu.Inline(currentGradeMenu.Row(btnCurrentGradeJunior, btnCurrentGradeMiddle, btnCurrentGradeSenior))
-	targetGradeMenu.Inline(targetGradeMenu.Row(btnTargetGradeJunior, btnTargetGradeMiddle, btnTargetGradeSenior))
+	targetGradeMenu.Inline(targetGradeMenu.Row(btnTargetGradeMiddle, btnTargetGradeSenior))
 	confirmationMenu.Inline(
 		confirmationMenu.Row(btnConfirmProfile),
 		confirmationMenu.Row(btnEditProfile),
@@ -209,6 +212,7 @@ type Repository interface {
 	EndSession(ctx context.Context, sessionID int64, status string) error
 	AdvancePhase(ctx context.Context, sessionID int64, newStatus string) error
 	SetQualificationAnswer(ctx context.Context, sessionID int64, step int, answer string) error
+	UpdateLegacyTargetGrade(ctx context.Context, sessionID int64, grade string) error
 	ResetQualification(ctx context.Context, sessionID int64) error
 	ConfirmQualification(ctx context.Context, sessionID, studentID int64, topics []string) error
 	SaveAuditResults(ctx context.Context, sessionID, studentID int64, topics []string) error
@@ -683,14 +687,29 @@ func (h *Handler) handleGradeCallback(c tele.Context) error {
 		h.logger.Error("get active session", "error", err)
 		return c.Send(genericErrorMessage)
 	}
+	// A target-grade button can also be shown to a session created by the
+	// previous release with target grade "джун". Preserve its progress and let
+	// the student switch to one of the two supported target levels in place.
+	if session.Status == db.SessionStatusQuestionCycle && session.Grade == "джун" {
+		grade, ok := normalizeTargetGrade(c.Data())
+		if !ok {
+			return c.Send("Для тренировки выбери целевой грейд: мидл или сеньор.", targetGradeMenu)
+		}
+		if err := h.repo.UpdateLegacyTargetGrade(ctx, session.ID, grade); err != nil {
+			h.logger.Error("update legacy target grade", "error", err, "session_id", session.ID)
+			return c.Send(genericErrorMessage)
+		}
+		session.Grade = grade
+		return h.askNextQuestion(ctx, c, student, session)
+	}
 	if session.Status != db.SessionStatusQualification ||
 		(session.QualificationStep != db.QualificationStepCurrentGrade && session.QualificationStep != db.QualificationStepTargetGrade) {
 		return c.Send("Этот выбор уже сохранён. Продолжаем с текущего шага.")
 	}
 
-	grade, ok := normalizeGrade(c.Data())
+	grade, ok := normalizeGradeForStep(c.Data(), session.QualificationStep)
 	if !ok {
-		return c.Send("Выбери грейд кнопкой: джун, мидл или сеньор.", gradeMenuForStep(session.QualificationStep))
+		return c.Send(gradeChoiceMessage(session.QualificationStep, true), gradeMenuForStep(session.QualificationStep))
 	}
 	step := session.QualificationStep
 	if err := h.repo.SetQualificationAnswer(ctx, session.ID, step, grade); err != nil {
@@ -846,9 +865,9 @@ func (h *Handler) handleQualification(ctx context.Context, c tele.Context, stude
 
 	switch session.QualificationStep {
 	case db.QualificationStepCurrentGrade:
-		grade, ok := normalizeGrade(answer)
+		grade, ok := normalizeGradeForStep(answer, db.QualificationStepCurrentGrade)
 		if !ok {
-			return c.Send("Выбери грейд: джун, мидл или сеньор.", currentGradeMenu)
+			return c.Send(gradeChoiceMessage(db.QualificationStepCurrentGrade, false), currentGradeMenu)
 		}
 		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepCurrentGrade, grade); err != nil {
 			return h.qualificationSaveError(c, session.ID, err)
@@ -856,9 +875,9 @@ func (h *Handler) handleQualification(ctx context.Context, c tele.Context, stude
 		return c.Send(targetGradeQuestion, targetGradeMenu)
 
 	case db.QualificationStepTargetGrade:
-		grade, ok := normalizeGrade(answer)
+		grade, ok := normalizeGradeForStep(answer, db.QualificationStepTargetGrade)
 		if !ok {
-			return c.Send("Выбери грейд: джун, мидл или сеньор.", targetGradeMenu)
+			return c.Send(gradeChoiceMessage(db.QualificationStepTargetGrade, false), targetGradeMenu)
 		}
 		if err := h.repo.SetQualificationAnswer(ctx, session.ID, db.QualificationStepTargetGrade, grade); err != nil {
 			return h.qualificationSaveError(c, session.ID, err)
@@ -914,6 +933,29 @@ func normalizeGrade(value string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func normalizeTargetGrade(value string) (string, bool) {
+	grade, ok := normalizeGrade(value)
+	return grade, ok && grade != "джун"
+}
+
+func normalizeGradeForStep(value string, step int) (string, bool) {
+	if step == db.QualificationStepTargetGrade {
+		return normalizeTargetGrade(value)
+	}
+	return normalizeGrade(value)
+}
+
+func gradeChoiceMessage(step int, button bool) string {
+	prefix := "Выбери грейд"
+	if button {
+		prefix += " кнопкой"
+	}
+	if step == db.QualificationStepTargetGrade {
+		return prefix + ": мидл или сеньор."
+	}
+	return prefix + ": джун, мидл или сеньор."
 }
 
 func gradeMenuForStep(step int) *tele.ReplyMarkup {
@@ -1267,6 +1309,9 @@ func (h *Handler) handleQuestionCycle(ctx context.Context, c tele.Context, stude
 // the student verbatim.
 func (h *Handler) askNextQuestion(ctx context.Context, c tele.Context, student *db.Student, session *db.Session) error {
 	grade := session.Grade
+	if grade == "джун" {
+		return c.Send("Целевой уровень «Джун» больше не используется. Выбери, на какой уровень продолжить тренировку: мидл или сеньор.", targetGradeMenu)
+	}
 	if grade == "" {
 		h.logger.Warn("question cycle started without a captured grade, using fallback",
 			"session_id", session.ID, "fallback_grade", fallbackGrade)
@@ -1332,7 +1377,7 @@ func formatPrimaryQuestion(question *db.QuestionBank, first bool) string {
 	if contextText == "" {
 		contextText = "Представь, что это вопрос с технического собеседования системного аналитика."
 	}
-	return fmt.Sprintf("%s\n\n%s\n\n<b>%s</b>\n\nОтветь текстом по формуле КДИР. Я разберу ответ и сразу дам обратную связь.",
+	return fmt.Sprintf("%s\n\n%s\n\n<b>%s</b>\n\nОтветь текстом своими словами. Если удобно, используй КДИР, чтобы структурировать ответ. Я разберу его и сразу дам обратную связь.",
 		html.EscapeString(lead), html.EscapeString(contextText), html.EscapeString(strings.TrimSpace(question.QuestionText)))
 }
 
@@ -1341,7 +1386,7 @@ func formatFollowupQuestion(contextText, questionText string, number int) string
 	if contextText == "" {
 		contextText = "Интервьюер хочет проверить, как ты применишь ответ на практике."
 	}
-	return fmt.Sprintf("Теперь уточняющий вопрос %d из 2.\n\n%s\n\n%s\n\nОтвечай так же текстом по формуле КДИР.",
+	return fmt.Sprintf("Теперь уточняющий вопрос %d из 2.\n\n%s\n\n%s\n\nОтвечай своими словами. При желании используй КДИР как подсказку для структуры.",
 		number, contextText, strings.TrimSpace(questionText))
 }
 

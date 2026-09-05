@@ -397,6 +397,29 @@ func (r *Repository) SetQualificationAnswer(ctx context.Context, sessionID int64
 	return nil
 }
 
+// UpdateLegacyTargetGrade updates an active question-cycle session created by
+// a release where "джун" was still offered as a target. It preserves answers,
+// attempts and the rest of the profile while requiring an explicit supported
+// replacement grade from the student.
+func (r *Repository) UpdateLegacyTargetGrade(ctx context.Context, sessionID int64, grade string) error {
+	if grade != "мидл" && grade != "сеньор" {
+		return fmt.Errorf("update legacy target grade: unsupported grade %q", grade)
+	}
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE sessions
+		 SET grade = $2
+		 WHERE id = $1 AND ended_at IS NULL AND status = 'QUESTION_CYCLE' AND grade = 'джун'`,
+		sessionID, grade,
+	)
+	if err != nil {
+		return fmt.Errorf("update legacy target grade: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("update legacy target grade: session is not waiting for a replacement target grade")
+	}
+	return nil
+}
+
 // AdvancePhase moves sessionID to newStatus, resets cycle_count to 0,
 // and clears current_question_id, so the per-phase turn caps and
 // question tracking in internal/handlers always start from a clean

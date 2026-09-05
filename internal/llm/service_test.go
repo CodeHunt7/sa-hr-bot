@@ -62,6 +62,18 @@ func TestNewService_SubstitutesSessionCycleLimit(t *testing.T) {
 	if !strings.Contains(svc.systemPrompt, "8 завершенных блоков") {
 		t.Fatalf("systemPrompt does not contain substituted limit: %q", svc.systemPrompt)
 	}
+	for _, want := range []string{
+		"Ты живой интервьюер и наставник",
+		"не единственно правильными",
+		"КДИР является рекомендацией",
+	} {
+		if !strings.Contains(svc.systemPrompt, want) {
+			t.Fatalf("systemPrompt does not contain soft evaluation rule %q", want)
+		}
+	}
+	if strings.Contains(svc.systemPrompt, "Прямота без смягчения") {
+		t.Fatal("systemPrompt still contains the old harsh tone rule")
+	}
 }
 
 func TestReply_UsesCustomBaseURLAndParsesUsage(t *testing.T) {
@@ -204,7 +216,7 @@ func TestBuildUserContext(t *testing.T) {
 		"требования: confirmed",
 		"Что такое нормализация?",
 		"Follow-up 1 (Контекст уточнения 1): А что такое 3НФ?",
-		"Эталон сеньор: сеньор ответ",
+		"Пример хорошего ответа для ориентира, не единственно правильный вариант: джун ответ",
 		"предпоследняя реплика",
 		"последняя реплика",
 	} {
@@ -214,6 +226,9 @@ func TestBuildUserContext(t *testing.T) {
 	}
 	if strings.Contains(got, "первая реплика, должна быть обрезана") {
 		t.Errorf("expected only the last %d turns to be included, got:\n%s", maxRecentTurns, got)
+	}
+	if strings.Contains(got, "мидл ответ") || strings.Contains(got, "сеньор ответ") {
+		t.Errorf("expected only the target-grade reference answer, got:\n%s", got)
 	}
 }
 
@@ -277,12 +292,17 @@ func TestEvaluate_SendsQuestionAndReferenceAnswersAsContext(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		studentAnswer, "junior-ref", "middle-ref", "senior-ref", "Что такое индекс в БД?",
+		studentAnswer, "middle-ref", "Что такое индекс в БД?",
 		"ФАЗА 3", "Не начинай квалификацию", "Не спрашивай грейд", "ответ бессмысленный",
+		"живой интервьюер и наставник", "не единственно правильным вариантом",
+		"один главный пробел", "КДИР является рекомендацией", "Целевой уровень: мидл",
 	} {
 		if !strings.Contains(gotUserContent, want) {
 			t.Errorf("expected the request's user message to contain %q, got:\n%s", want, gotUserContent)
 		}
+	}
+	if strings.Contains(gotUserContent, "junior-ref") || strings.Contains(gotUserContent, "senior-ref") {
+		t.Errorf("expected only the middle reference answer, got:\n%s", gotUserContent)
 	}
 }
 
@@ -318,11 +338,97 @@ func TestBuildBlockEvaluationContext_IncludesThreeAnswersAndKDIR(t *testing.T) {
 	for _, want := range []string{
 		"ФАЗА 3", "основной ответ", "уточнение один", "ответ два",
 		"уточнение два", "ответ три", "БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ",
-		"Контекст, Действие, Инструмент, Результат", "WEAK_ZONE_STATUS",
+		"Итог", "Сильная сторона", "Главная точка роста", "Как усилить ответ",
+		"КДИР", "рекомендацию по подаче", "WEAK_ZONE_STATUS",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("block context does not contain %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestBuildEvaluationContext_UsesSeniorDepthWithoutTurningReferenceIntoChecklist(t *testing.T) {
+	question := &db.QuestionBank{
+		QuestionText: "Как выбрать способ интеграции?",
+		AnswerSenior: "Один из возможных ответов",
+	}
+	got := BuildEvaluationContext(
+		StudentProfile{TargetGrade: "сеньор"}, nil,
+		"Выбрал очередь и объяснил причины", question,
+	)
+
+	for _, want := range []string{
+		"Целевой уровень: сеньор",
+		"компромиссы, риски и альтернативы только там",
+		"не чек-листом терминов",
+		"Не добавляй обязательные детали",
+		"Короткий корректный ответ не называй неправильным",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("senior evaluation context does not contain %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestEvaluationContextsExposeOnlyTheReferenceForTheCurrentQuestion(t *testing.T) {
+	question := &db.QuestionBank{
+		QuestionText: "Как выбрать архитектуру?",
+		Followup1:    "Что изменится при росте нагрузки?",
+		Followup2:    "Что изменится при сокращении бюджета?",
+		AnswerMiddle: "Пример к основному вопросу: основной ориентир\n" +
+			"Пример к первому дожиму: ориентир первого дожима\n" +
+			"Пример ко второму дожиму: ориентир второго дожима",
+	}
+	profile := StudentProfile{TargetGrade: "мидл"}
+
+	primary := BuildEvaluationContext(profile, nil, "ответ", question)
+	if !strings.Contains(primary, "основной ориентир") || strings.Contains(primary, "ориентир первого дожима") ||
+		strings.Contains(primary, "Что изменится при росте нагрузки?") {
+		t.Fatalf("primary evaluation leaked a future follow-up or its reference:\n%s", primary)
+	}
+
+	followup := BuildFollowupEvaluationContext(profile, nil, "ответ", question.Followup1, "уточнение", question)
+	if !strings.Contains(followup, "ориентир первого дожима") || strings.Contains(followup, "основной ориентир") ||
+		strings.Contains(followup, "ориентир второго дожима") || strings.Contains(followup, question.Followup2) {
+		t.Fatalf("first follow-up evaluation received references outside its scope:\n%s", followup)
+	}
+
+	block := BuildBlockEvaluationContext(profile, nil, "ответ", question.Followup1, "уточнение 1", question.Followup2, "уточнение 2", question)
+	for _, want := range []string{"основной ориентир", "ориентир первого дожима", "ориентир второго дожима"} {
+		if !strings.Contains(block, want) {
+			t.Fatalf("block evaluation is missing %q:\n%s", want, block)
+		}
+	}
+}
+
+func TestEvaluationGuidelinesAreTopicIndependent(t *testing.T) {
+	tests := []struct {
+		name     string
+		topic    string
+		question string
+	}{
+		{name: "diagram", topic: "архитектура", question: "Как используешь ERD или C4?"},
+		{name: "token", topic: "безопасность", question: "Откуда сервис получает роли для токена?"},
+		{name: "requirements", topic: "требования", question: "Как проверяешь полноту требований?"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := BuildEvaluationContext(
+				StudentProfile{TargetGrade: "мидл"}, nil, "короткий ответ",
+				&db.QuestionBank{Topic: tt.topic, QuestionText: tt.question, AnswerMiddle: "пример"},
+			)
+			for _, want := range []string{
+				"живой интервьюер и наставник",
+				"один главный пробел",
+				"Не добавляй обязательные детали",
+				"КДИР является рекомендацией",
+			} {
+				if !strings.Contains(got, want) {
+					t.Errorf("topic %q did not receive common rule %q:\n%s", tt.topic, want, got)
+				}
+			}
+		})
 	}
 }
 

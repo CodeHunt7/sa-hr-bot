@@ -37,7 +37,7 @@ var allowedGrades = map[string]bool{
 
 var allowedTopics = map[string]bool{
 	"интеграции": true, "архитектура": true, "бд": true,
-	"требования": true, "безопасность": true,
+	"требования": true, "безопасность": true, "soft-skills": true,
 }
 
 // Sync validates path completely and then updates the bank in one transaction.

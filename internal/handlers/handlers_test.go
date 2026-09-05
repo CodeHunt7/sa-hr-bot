@@ -346,6 +346,19 @@ func (r *fakeRepo) SetQualificationAnswer(_ context.Context, sessionID int64, st
 	return nil
 }
 
+func (r *fakeRepo) UpdateLegacyTargetGrade(_ context.Context, sessionID int64, grade string) error {
+	r.maybePanic()
+	s, ok := r.sessions[sessionID]
+	if !ok || s.EndedAt != nil || s.Status != db.SessionStatusQuestionCycle || s.Grade != "джун" {
+		return errors.New("session is not waiting for a replacement target grade")
+	}
+	if grade != "мидл" && grade != "сеньор" {
+		return errors.New("unsupported target grade")
+	}
+	s.Grade = grade
+	return nil
+}
+
 func (r *fakeRepo) ResetQualification(_ context.Context, sessionID int64) error {
 	r.maybePanic()
 	s, ok := r.sessions[sessionID]
@@ -789,6 +802,19 @@ func TestFullSessionFlow(t *testing.T) {
 		t.Fatalf("expected target grade question, got %v", currentGradeCtx.sent)
 	}
 
+	rejectedJuniorTarget := newCtx(telegramID, "")
+	rejectedJuniorTarget.data = "джун"
+	if err := h.handleGradeCallback(rejectedJuniorTarget); err != nil {
+		t.Fatalf("reject junior target grade callback: %v", err)
+	}
+	if len(rejectedJuniorTarget.sent) != 1 || !strings.Contains(rejectedJuniorTarget.sent[0], "мидл или сеньор") {
+		t.Fatalf("expected target-grade restriction, got %v", rejectedJuniorTarget.sent)
+	}
+	session, _ = repo.GetActiveSession(ctx, telegramID)
+	if session.QualificationStep != db.QualificationStepTargetGrade || session.Grade != "" {
+		t.Fatalf("junior target grade must not be saved, got %+v", session)
+	}
+
 	targetGradeCtx := newCtx(telegramID, "")
 	targetGradeCtx.data = "мидл"
 	if err := h.handleGradeCallback(targetGradeCtx); err != nil {
@@ -1044,6 +1070,55 @@ func TestFullSessionFlow(t *testing.T) {
 	}
 	if lm.pickCalls != 2 {
 		t.Fatalf("expected exactly 2 picked primary questions, got %d", lm.pickCalls)
+	}
+}
+
+func TestTargetGradeMenuContainsOnlyMiddleAndSenior(t *testing.T) {
+	if len(targetGradeMenu.InlineKeyboard) != 1 || len(targetGradeMenu.InlineKeyboard[0]) != 2 {
+		t.Fatalf("unexpected target grade keyboard: %+v", targetGradeMenu.InlineKeyboard)
+	}
+	got := []string{targetGradeMenu.InlineKeyboard[0][0].Text, targetGradeMenu.InlineKeyboard[0][1].Text}
+	if strings.Join(got, ",") != "Мидл,Сеньор" {
+		t.Fatalf("target grades = %v, want [Мидл Сеньор]", got)
+	}
+	if len(currentGradeMenu.InlineKeyboard) != 1 || len(currentGradeMenu.InlineKeyboard[0]) != 3 {
+		t.Fatalf("current grade keyboard must retain junior: %+v", currentGradeMenu.InlineKeyboard)
+	}
+}
+
+func TestLegacyJuniorTargetCanBeReplacedWithoutLosingSession(t *testing.T) {
+	repo := newFakeRepo()
+	student := &db.Student{TelegramID: 77, Name: "Тест", AccessCode: "SA2026-LEGACY"}
+	session := &db.Session{
+		ID: 1, StudentID: student.TelegramID, Status: db.SessionStatusQuestionCycle,
+		CurrentGrade: "джун", Grade: "джун", StrongZones: "требования", WeakZonesInput: "бд",
+	}
+	question := &db.QuestionBank{ID: 10, QuestionText: "Новый вопрос", Grade: "мидл-сеньор", Topic: "бд"}
+	repo.students[student.TelegramID] = student
+	repo.sessions[session.ID] = session
+	repo.questions[question.ID] = question
+	lm := &fakeLLM{question: question}
+	h := New(repo, lm, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, nil)
+
+	requestCtx := newCtx(student.TelegramID, "")
+	if err := h.askNextQuestion(context.Background(), requestCtx, student, session); err != nil {
+		t.Fatalf("askNextQuestion legacy target: %v", err)
+	}
+	if len(requestCtx.sent) != 1 || !strings.Contains(requestCtx.sent[0], "мидл или сеньор") || lm.pickCalls != 0 {
+		t.Fatalf("expected replacement target prompt before picking, got sent=%v picks=%d", requestCtx.sent, lm.pickCalls)
+	}
+
+	chooseCtx := newCtx(student.TelegramID, "")
+	chooseCtx.data = "мидл"
+	if err := h.handleGradeCallback(chooseCtx); err != nil {
+		t.Fatalf("replace legacy target: %v", err)
+	}
+	updated, _ := repo.GetActiveSession(context.Background(), student.TelegramID)
+	if updated.Grade != "мидл" || updated.CurrentGrade != "джун" || updated.StrongZones != "требования" || updated.WeakZonesInput != "бд" {
+		t.Fatalf("legacy profile or progress was lost: %+v", updated)
+	}
+	if lm.pickCalls != 1 || lm.lastPickGrade != "мидл" || len(chooseCtx.sent) != 1 || !strings.Contains(chooseCtx.sent[0], "Новый вопрос") {
+		t.Fatalf("expected middle question after replacement, sent=%v grade=%q picks=%d", chooseCtx.sent, lm.lastPickGrade, lm.pickCalls)
 	}
 }
 

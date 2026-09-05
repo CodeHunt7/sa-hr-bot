@@ -12,6 +12,11 @@ func TestValidateQuestionRow(t *testing.T) {
 	if err := validateQuestionRow(valid, columns); err != nil {
 		t.Fatalf("valid row rejected: %v", err)
 	}
+	softSkills := append([]string(nil), valid...)
+	softSkills[3] = "soft-skills"
+	if err := validateQuestionRow(softSkills, columns); err != nil {
+		t.Fatalf("soft-skills row rejected: %v", err)
+	}
 
 	tests := []struct {
 		name  string

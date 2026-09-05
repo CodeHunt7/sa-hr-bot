@@ -16,4 +16,5 @@ coverage
 *.test
 materials/*.md
 materials/*.pdf
+materials/*.xlsx
 materials/question_bank_*.csv

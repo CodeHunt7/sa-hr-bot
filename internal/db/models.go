@@ -159,7 +159,7 @@ type WeakZone struct {
 //
 // Grade holds one of: "джун", "джун-мидл", "мидл", "мидл-сеньор", "сеньор".
 // Topic holds one of: "интеграции", "архитектура", "бд", "требования",
-// "безопасность".
+// "безопасность", "soft-skills".
 type QuestionBank struct {
 	ID               int64  `db:"id"`
 	QuestionText     string `db:"question_text"`

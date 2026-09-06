@@ -66,6 +66,8 @@ func TestNewService_SubstitutesSessionCycleLimit(t *testing.T) {
 		"Ты живой интервьюер и наставник",
 		"не единственно правильными",
 		"КДИР является рекомендацией",
+		"Существенного пробела по этому вопросу нет",
+		"Не выдумывай недостаток ради формата",
 	} {
 		if !strings.Contains(svc.systemPrompt, want) {
 			t.Fatalf("systemPrompt does not contain soft evaluation rule %q", want)
@@ -73,6 +75,9 @@ func TestNewService_SubstitutesSessionCycleLimit(t *testing.T) {
 	}
 	if strings.Contains(svc.systemPrompt, "Прямота без смягчения") {
 		t.Fatal("systemPrompt still contains the old harsh tone rule")
+	}
+	if strings.Contains(svc.systemPrompt, "есть в ответе, один главный пробел") {
+		t.Fatal("systemPrompt still requires a gap in every answer")
 	}
 }
 
@@ -118,6 +123,9 @@ func TestReply_UsesCustomBaseURLAndParsesUsage(t *testing.T) {
 	}
 	if gotAuth != "Bearer test-key" {
 		t.Fatalf("unexpected Authorization header: %q", gotAuth)
+	}
+	if gotBody["temperature"] != 0.2 {
+		t.Fatalf("temperature = %v, want 0.2 for stable evaluation", gotBody["temperature"])
 	}
 
 	messages, _ := gotBody["messages"].([]any)
@@ -295,7 +303,8 @@ func TestEvaluate_SendsQuestionAndReferenceAnswersAsContext(t *testing.T) {
 		studentAnswer, "middle-ref", "Что такое индекс в БД?",
 		"ФАЗА 3", "Не начинай квалификацию", "Не спрашивай грейд", "ответ бессмысленный",
 		"живой интервьюер и наставник", "не единственно правильным вариантом",
-		"один главный пробел", "КДИР является рекомендацией", "Целевой уровень: мидл",
+		"Существенного пробела по этому вопросу нет", "Не выдумывай недостаток",
+		"КДИР является рекомендацией", "Целевой уровень: мидл",
 	} {
 		if !strings.Contains(gotUserContent, want) {
 			t.Errorf("expected the request's user message to contain %q, got:\n%s", want, gotUserContent)
@@ -420,7 +429,8 @@ func TestEvaluationGuidelinesAreTopicIndependent(t *testing.T) {
 			)
 			for _, want := range []string{
 				"живой интервьюер и наставник",
-				"один главный пробел",
+				"Существенного пробела по этому вопросу нет",
+				"Не выдумывай недостаток",
 				"Не добавляй обязательные детали",
 				"КДИР является рекомендацией",
 			} {
@@ -429,6 +439,31 @@ func TestEvaluationGuidelinesAreTopicIndependent(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestStrongRequirementsAnswerMayBeAcceptedWithoutInventedGap(t *testing.T) {
+	answer := "Уточняю бизнес-цель и KPI, пользователей, интеграции, ограничения, границы проекта, сроки и бюджет."
+	got := BuildEvaluationContext(
+		StudentProfile{TargetGrade: "мидл"}, nil, answer,
+		&db.QuestionBank{
+			Topic:           "требования",
+			QuestionText:    "Какие вопросы вы задаете бизнесу перед началом проекта?",
+			AnswerMiddle:    "Цель, пользователь, критерии успеха, сроки и бюджет.",
+			AnswerSenior:    "Цель, пользователь, критерии успеха, сроки и бюджет.",
+			QuestionContext: "Интервьюер проверяет работу с требованиями.",
+		},
+	)
+
+	for _, want := range []string{
+		answer,
+		"Не объявляй отсутствующим то, что он уже назвал напрямую или по смыслу",
+		"Существенного пробела по этому вопросу нет",
+		"сильный ответ разрешено принять без критики",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("strong-answer context does not contain %q:\n%s", want, got)
+		}
 	}
 }
 

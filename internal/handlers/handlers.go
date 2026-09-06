@@ -1386,8 +1386,9 @@ func formatFollowupQuestion(contextText, questionText string, number int) string
 	if contextText == "" {
 		contextText = "Интервьюер хочет проверить, как ты применишь ответ на практике."
 	}
-	return fmt.Sprintf("Теперь уточняющий вопрос %d из 2.\n\n%s\n\n%s\n\nОтвечай своими словами. При желании используй КДИР как подсказку для структуры.",
-		number, contextText, strings.TrimSpace(questionText))
+	questionText = capitalizeFirst(strings.TrimSpace(questionText))
+	return fmt.Sprintf("Теперь уточняющий вопрос %d из 2.\n\n%s\n\n<b>%s</b>\n\nОтвечай своими словами. При желании используй КДИР как подсказку для структуры.",
+		number, html.EscapeString(contextText), html.EscapeString(questionText))
 }
 
 // pickPriorityTopic returns the topic PickQuestion should prioritize.
@@ -1482,7 +1483,7 @@ func (h *Handler) deliverPrimaryFeedback(ctx context.Context, c tele.Context, at
 	if err := sendText(c, attempt.PrimaryFeedback); err != nil {
 		return err
 	}
-	if err := c.Send(attempt.FollowupQuestion); err != nil {
+	if err := c.Send(attempt.FollowupQuestion, tele.ModeHTML); err != nil {
 		return err
 	}
 	if err := h.repo.MarkPrimaryFeedbackDelivered(ctx, attempt.ID); err != nil {
@@ -1545,7 +1546,7 @@ func (h *Handler) deliverFollowupFeedback(ctx context.Context, c tele.Context, a
 	if err := sendText(c, attempt.FollowupFeedback); err != nil {
 		return err
 	}
-	if err := c.Send(attempt.Followup2Question); err != nil {
+	if err := c.Send(attempt.Followup2Question, tele.ModeHTML); err != nil {
 		return err
 	}
 	if err := h.repo.MarkFollowupFeedbackDelivered(ctx, attempt.ID); err != nil {

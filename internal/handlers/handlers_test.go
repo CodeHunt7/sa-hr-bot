@@ -930,8 +930,11 @@ func TestFullSessionFlow(t *testing.T) {
 	if !strings.Contains(answerCtx.sent[0], "ОБРАТНАЯ СВЯЗЬ") {
 		t.Fatalf("expected the evaluation frame first, got %q", answerCtx.sent[0])
 	}
-	if !strings.Contains(answerCtx.sent[1], "follow-up q") || !strings.Contains(answerCtx.sent[1], "уточняющий вопрос 1") {
+	if !strings.Contains(answerCtx.sent[1], "<b>Follow-up q</b>") || !strings.Contains(answerCtx.sent[1], "уточняющий вопрос 1") {
 		t.Fatalf("expected the follow-up second, got %q", answerCtx.sent[1])
+	}
+	if len(answerCtx.sentOptions) != 2 || len(answerCtx.sentOptions[1]) != 1 || answerCtx.sentOptions[1][0] != tele.ModeHTML {
+		t.Fatalf("expected the follow-up in Telegram HTML mode, got %+v", answerCtx.sentOptions)
 	}
 	if lm.lastEvalQuestion == nil || lm.lastEvalQuestion.ID != 1 || lm.lastEvalQuestion.AnswerSenior != "senior answer" {
 		t.Fatalf("expected Evaluate to receive the question fetched by id with its reference answers, got %+v", lm.lastEvalQuestion)
@@ -954,8 +957,11 @@ func TestFullSessionFlow(t *testing.T) {
 	if err := h.handleMessage(followupCtx); err != nil {
 		t.Fatalf("handleMessage follow-up answer 1: %v", err)
 	}
-	if len(followupCtx.sent) != 2 || !strings.Contains(followupCtx.sent[1], "follow-up q2") || !strings.Contains(followupCtx.sent[1], "уточняющий вопрос 2") {
+	if len(followupCtx.sent) != 2 || !strings.Contains(followupCtx.sent[1], "<b>Follow-up q2</b>") || !strings.Contains(followupCtx.sent[1], "уточняющий вопрос 2") {
 		t.Fatalf("expected mini-feedback and second follow-up, got %v", followupCtx.sent)
+	}
+	if len(followupCtx.sentOptions) != 2 || len(followupCtx.sentOptions[1]) != 1 || followupCtx.sentOptions[1][0] != tele.ModeHTML {
+		t.Fatalf("expected the second follow-up in Telegram HTML mode, got %+v", followupCtx.sentOptions)
 	}
 	session, _ = repo.GetActiveSession(ctx, telegramID)
 	if session.CycleCount != 0 {
@@ -1805,7 +1811,7 @@ func TestQuestionCycle_RecoversLegacyCurrentQuestionWithoutAttempt(t *testing.T)
 	if err := h.handleQuestionCycle(context.Background(), ctx, student, session); err != nil {
 		t.Fatalf("handleQuestionCycle: %v", err)
 	}
-	if len(ctx.sent) != 2 || !strings.Contains(ctx.sent[1], "legacy follow-up") {
+	if len(ctx.sent) != 2 || !strings.Contains(ctx.sent[1], "<b>Legacy follow-up</b>") {
 		t.Fatalf("expected recovered attempt feedback and follow-up, got %v", ctx.sent)
 	}
 	attempt, err := repo.GetActiveQuestionAttempt(context.Background(), session.ID)
@@ -1924,6 +1930,54 @@ func TestFormatPrimaryQuestionBoldsOnlyQuestionAndEscapesHTML(t *testing.T) {
 	}
 	if strings.Contains(got, "<b>Отлично") || strings.Contains(got, "<b>Контекст") || strings.Contains(got, "КДИР.</b>") {
 		t.Fatalf("text outside the question was bolded: %q", got)
+	}
+}
+
+func TestFormatFollowupQuestionCapitalizesAndBoldsOnlyQuestion(t *testing.T) {
+	got := formatFollowupQuestion("Контекст про A & B", "а если cache < database?", 1)
+
+	if !strings.Contains(got, "Контекст про A &amp; B") {
+		t.Fatalf("follow-up context was not escaped: %q", got)
+	}
+	if !strings.Contains(got, "<b>А если cache &lt; database?</b>") {
+		t.Fatalf("follow-up question was not capitalized and safely bolded: %q", got)
+	}
+	if strings.Contains(got, "<b>Теперь") || strings.Contains(got, "<b>Контекст") || strings.Contains(got, "структуры.</b>") {
+		t.Fatalf("text outside the follow-up question was bolded: %q", got)
+	}
+}
+
+func TestDeliverFollowupQuestionsUsesTelegramHTMLMode(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	primaryRepo := newFakeRepo()
+	primaryAttempt := &db.QuestionAttempt{
+		ID: 1, Status: db.QuestionAttemptPrimaryFeedbackReady,
+		PrimaryFeedback: "обратная связь", FollowupQuestion: "<b>Первый дожим</b>",
+	}
+	primaryRepo.attempts[primaryAttempt.ID] = primaryAttempt
+	primaryHandler := New(primaryRepo, &fakeLLM{}, logger, 8, nil)
+	primaryCtx := newCtx(1, "")
+	if err := primaryHandler.deliverPrimaryFeedback(context.Background(), primaryCtx, primaryAttempt); err != nil {
+		t.Fatalf("deliver primary feedback: %v", err)
+	}
+	if len(primaryCtx.sentOptions) != 2 || len(primaryCtx.sentOptions[1]) != 1 || primaryCtx.sentOptions[1][0] != tele.ModeHTML {
+		t.Fatalf("first follow-up was not sent in HTML mode: %+v", primaryCtx.sentOptions)
+	}
+
+	followupRepo := newFakeRepo()
+	followupAttempt := &db.QuestionAttempt{
+		ID: 2, Status: db.QuestionAttemptFollowupFeedbackReady,
+		FollowupFeedback: "обратная связь", Followup2Question: "<b>Второй дожим</b>",
+	}
+	followupRepo.attempts[followupAttempt.ID] = followupAttempt
+	followupHandler := New(followupRepo, &fakeLLM{}, logger, 8, nil)
+	followupCtx := newCtx(1, "")
+	if err := followupHandler.deliverFollowupFeedback(context.Background(), followupCtx, followupAttempt); err != nil {
+		t.Fatalf("deliver follow-up feedback: %v", err)
+	}
+	if len(followupCtx.sentOptions) != 2 || len(followupCtx.sentOptions[1]) != 1 || followupCtx.sentOptions[1][0] != tele.ModeHTML {
+		t.Fatalf("second follow-up was not sent in HTML mode: %+v", followupCtx.sentOptions)
 	}
 }
 

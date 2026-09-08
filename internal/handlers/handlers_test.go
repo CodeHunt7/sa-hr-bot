@@ -823,7 +823,7 @@ func TestFullSessionFlow(t *testing.T) {
 	if len(targetGradeCtx.sent) != 1 || targetGradeCtx.sent[0] != strongZonesQuestion {
 		t.Fatalf("expected strong zones question, got %v", targetGradeCtx.sent)
 	}
-	if !strings.Contains(targetGradeCtx.sent[0], "<i>выбери варианты и напиши мне их текстом</i>") ||
+	if !strings.Contains(targetGradeCtx.sent[0], "<i>выберите варианты и напишите мне их текстом</i>") ||
 		len(targetGradeCtx.sentOptions) != 1 || len(targetGradeCtx.sentOptions[0]) != 1 || targetGradeCtx.sentOptions[0][0] != tele.ModeHTML {
 		t.Fatalf("expected italic hint rendered as Telegram HTML, text=%q options=%+v", targetGradeCtx.sent[0], targetGradeCtx.sentOptions)
 	}
@@ -835,7 +835,7 @@ func TestFullSessionFlow(t *testing.T) {
 	if len(strongCtx.sent) != 1 || strongCtx.sent[0] != weakZonesQuestion {
 		t.Fatalf("expected weak zones question, got %v", strongCtx.sent)
 	}
-	if !strings.Contains(strongCtx.sent[0], "<i>выбери варианты и напиши мне их текстом</i>") ||
+	if !strings.Contains(strongCtx.sent[0], "<i>выберите варианты и напишите мне их текстом</i>") ||
 		len(strongCtx.sentOptions) != 1 || len(strongCtx.sentOptions[0]) != 1 || strongCtx.sentOptions[0][0] != tele.ModeHTML {
 		t.Fatalf("expected italic hint rendered as Telegram HTML, text=%q options=%+v", strongCtx.sent[0], strongCtx.sentOptions)
 	}
@@ -1026,7 +1026,7 @@ func TestFullSessionFlow(t *testing.T) {
 	if err := h.handleMessage(finalCtx); err != nil {
 		t.Fatalf("handleMessage second follow-up in block 2: %v", err)
 	}
-	if len(finalCtx.sent) != 3 || finalCtx.sent[2] != "Хочешь продолжить тренировку?" {
+	if len(finalCtx.sent) != 3 || finalCtx.sent[2] != "Хотите продолжить тренировку?" {
 		t.Fatalf("expected feedback and soft-limit choice, got %v", finalCtx.sent)
 	}
 
@@ -1944,6 +1944,39 @@ func TestFormatFollowupQuestionCapitalizesAndBoldsOnlyQuestion(t *testing.T) {
 	}
 	if strings.Contains(got, "<b>Теперь") || strings.Contains(got, "<b>Контекст") || strings.Contains(got, "структуры.</b>") {
 		t.Fatalf("text outside the follow-up question was bolded: %q", got)
+	}
+}
+
+func TestCandidateFacingCopyUsesAccurateCountAndFormalAddress(t *testing.T) {
+	for _, want := range []string{"174 вопроса", "58 основных", "116 уточняющих"} {
+		if !strings.Contains(instructionMessage, want) {
+			t.Errorf("instruction is missing %q: %q", want, instructionMessage)
+		}
+	}
+	if strings.Contains(instructionMessage, "собраны 58 вопросов") {
+		t.Fatal("instruction still presents only the number of primary questions")
+	}
+
+	question := &db.QuestionBank{QuestionText: "Что такое API?"}
+	candidateFacing := strings.Join([]string{
+		instructionMessage,
+		currentGradeQuestion,
+		targetGradeQuestion,
+		strongZonesQuestion,
+		weakZonesQuestion,
+		kdirLessonMessage,
+		formatQualificationSummary(&db.Session{}),
+		formatPrimaryQuestion(question, true),
+		formatFollowupQuestion("", "как проверить решение?", 1),
+	}, "\n")
+	for _, forbidden := range []string{
+		" для тебя", " про тебя", " твой", " твои", " твоих", " тебе",
+		"Какой у тебя", "собеседуешься", "Напиши ответ", "Ответь текстом",
+		"Отвечай своими", "Посмотри видео", "выбери варианты",
+	} {
+		if strings.Contains(candidateFacing, forbidden) {
+			t.Errorf("candidate-facing copy contains informal address %q", forbidden)
+		}
 	}
 }
 

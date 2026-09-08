@@ -58,6 +58,21 @@ func TestActiveQuestionBankMatchesKatyaSourceContract(t *testing.T) {
 				}
 			}
 		}
+		for _, fieldName := range []string{
+			"question_text", "question_context",
+			"followup_1", "followup_1_context",
+			"followup_2", "followup_2_context",
+		} {
+			value := strings.ToLower(row[columns[fieldName]])
+			for _, forbidden := range []string{
+				" как ты ", " тебе ", " тебя ", " твой ", " твои ", " твоя ",
+				"объясни,", "представь,", "расскажи,", "приведи ", "опиши,",
+			} {
+				if strings.Contains(" "+value+" ", forbidden) {
+					t.Fatalf("row %d field %s contains informal candidate address %q", rowNumber+2, fieldName, forbidden)
+				}
+			}
+		}
 		if row[columns["answer_middle"]] != row[columns["answer_senior"]] {
 			t.Fatalf("row %d must use the same stakeholder example for both target levels", rowNumber+2)
 		}

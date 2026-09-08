@@ -60,7 +60,7 @@ const (
 	llmOperationSummary          = "summary"
 )
 
-const genericErrorMessage = "Что-то сломалось на моей стороне. Попробуй написать еще раз через минуту."
+const genericErrorMessage = "Что-то сломалось на моей стороне. Попробуйте написать еще раз через минуту."
 
 const telegramTextChunkLimit = 3900
 
@@ -75,52 +75,52 @@ const (
 	readyPhotoPath   = "media/pic2.PNG"
 	kdirVideoPath    = "media/vid1-kdir.mp4"
 
-	instructionMessage = `Привет. Меня зовут Катя Желатинка, я собрала для тебя тренажёр для отработки технических собеседований системного аналитика.
+	instructionMessage = `Привет. Меня зовут Катя Желатинка, я собрала для вас тренажёр для отработки технических собеседований системного аналитика.
 
-Это не чат-бот общего назначения. Под капотом этого ИИ-агента собраны 58 вопросов, которые задают на собесах в 2026 году.
+Это не чат-бот общего назначения. Под капотом этого ИИ-агента собраны 174 вопроса: 58 основных и 116 уточняющих. Их задают на собесах в 2026 году.
 
-Формат простой: сначала 4 коротких вопроса про тебя, чтобы лучше понять твой запрос. Дальше цикл вопросов с разбором каждого ответа. Фидбек получаешь сразу, без ожидания.
+Формат простой: сначала 4 коротких вопроса о вас, чтобы лучше понять ваш запрос. Дальше цикл вопросов с разбором каждого ответа. Фидбек вы получаете сразу, без ожидания.
 
-Представь, что готовишься к экзамену на права для авто, все тоже самое, только готовимся к собеседованию.
+Представьте, что готовитесь к экзамену на права для авто. Здесь все то же самое, только готовимся к собеседованию.
 
-Я буду задавать тебе основной вопрос и два дополнительных, а после буду давать обратную связь и разъяснение по твоим ответам.
+Я буду задавать вам основной вопрос и два дополнительных, а после буду давать обратную связь и разъяснения по вашим ответам.
 
 Прежде чем начнём - 4 вопроса, чтобы подобрать нужный уровень сложности. Начинаем?`
-	currentGradeQuestion = "Вопрос 1/4\nКакой у тебя текущий грейд?"
-	targetGradeQuestion  = "Вопрос 2/4\nНа какой грейд собеседуешься?"
+	currentGradeQuestion = "Вопрос 1/4\nКакой у вас текущий грейд?"
+	targetGradeQuestion  = "Вопрос 2/4\nНа какой грейд вы собеседуетесь?"
 	strongZonesQuestion  = `Вопрос 3/4
-Какие технические зоны ты знаешь лучше всего?
+Какие технические зоны вы знаете лучше всего?
 
-Напиши ответ текстом:
+Напишите ответ текстом:
 - Интеграции
 - Базы данных
 - Архитектура
 - Требования
 - Безопасность
 
-<i>выбери варианты и напиши мне их текстом</i>`
+<i>выберите варианты и напишите мне их текстом</i>`
 	weakZonesQuestion = `Вопрос 4/4
-Какие технические зоны ты знаешь хуже всего?
+Какие технические зоны вы знаете хуже всего?
 
-Напиши ответ текстом:
+Напишите ответ текстом:
 - Интеграции
 - Базы данных
 - Архитектура
 - Требования
 - Безопасность
 
-<i>выбери варианты и напиши мне их текстом</i>`
+<i>выберите варианты и напишите мне их текстом</i>`
 	kdirLessonMessage = `Отлично, прежде чем начнём отработку - один короткий урок.
 
 Разбираю в нём формулу КДИР: Контекст, Действие, Инструмент, Результат.
 
-Это удобная подсказка для структуры ответа. Она помогает показать масштаб задачи, твои действия, использованные инструменты и результат.
+Это удобная подсказка для структуры ответа. Она помогает показать масштаб задачи, ваши действия, использованные инструменты и результат.
 
 Не обязательно укладывать каждый ответ в КДИР дословно. Если ответ по смыслу верный и аргументированный, я это учту. Если структуры будет не хватать, я коротко напомню про формулу.
 
-Посмотри урок и попробуй использовать КДИР там, где она помогает яснее донести мысль.
+Посмотрите урок и попробуйте использовать КДИР там, где она помогает яснее донести мысль.
 
-Посмотри видео, потом жми «Готов(а)».`
+Посмотрите видео, потом нажмите «Готов(а)».`
 )
 
 // weakTopicsMarkerRE matches the WEAK_TOPICS: marker line the model
@@ -547,10 +547,10 @@ func newHandlerContext() (context.Context, context.CancelFunc) {
 func validateCandidateAnswer(text string) (string, string) {
 	answer := strings.TrimSpace(text)
 	if answer == "" {
-		return "", "Нужен текстовый ответ, чтобы я мог продолжить."
+		return "", "Нужен текстовый ответ, чтобы я могла продолжить."
 	}
 	if utf8.RuneCountInString(answer) > maxCandidateAnswerRunes {
-		return "", fmt.Sprintf("Ответ слишком длинный. Сократи его до %d символов.", maxCandidateAnswerRunes)
+		return "", fmt.Sprintf("Ответ слишком длинный. Сократите его до %d символов.", maxCandidateAnswerRunes)
 	}
 	return answer, ""
 }
@@ -601,7 +601,7 @@ func (h *Handler) handleStart(c tele.Context) error {
 		return c.Send(genericErrorMessage)
 	default:
 		return c.Send(
-			"У тебя уже есть активная сессия. Начать заново или продолжить?",
+			"У вас уже есть активная сессия. Начать заново или продолжить?",
 			restartMenu,
 		)
 	}
@@ -612,14 +612,14 @@ func (h *Handler) handleStart(c tele.Context) error {
 func (h *Handler) registerAndStart(ctx context.Context, c tele.Context, telegramID int64) error {
 	args := c.Args()
 	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
-		return c.Send("Чтобы начать, напиши /start и код доступа через пробел, например /start SA2026-ABCD")
+		return c.Send("Чтобы начать, напишите /start и код доступа через пробел, например /start SA2026-ABCD")
 	}
 	code := strings.TrimSpace(args[0])
 
 	student, err := h.repo.CreateStudentIfAccessCodeValid(ctx, telegramID, displayName(c.Sender()), code)
 	switch {
 	case errors.Is(err, db.ErrAccessCodeInvalid):
-		return c.Send("Код не подходит. Проверь, что скопировал его без пробелов и опечаток, и попробуй еще раз.")
+		return c.Send("Код не подходит. Проверьте, что скопировали его без пробелов и опечаток, и попробуйте еще раз.")
 	case errors.Is(err, db.ErrStudentAlreadyRegistered):
 		// Race: registered between our earlier lookup and this insert.
 		student, err = h.repo.GetStudentByTelegramID(ctx, telegramID)
@@ -675,7 +675,7 @@ func (h *Handler) handleGradeCallback(c tele.Context) error {
 	defer cancel()
 	student, err := h.repo.GetStudentByTelegramID(ctx, telegramID)
 	if errors.Is(err, db.ErrStudentNotFound) {
-		return c.Send("Похоже, ты еще не зарегистрирован. Напиши /start и код доступа, который тебе прислали.")
+		return c.Send("Похоже, вы еще не зарегистрированы. Напишите /start и код доступа, который вам прислали.")
 	}
 	if err != nil {
 		h.logger.Error("get student", "error", err)
@@ -693,7 +693,7 @@ func (h *Handler) handleGradeCallback(c tele.Context) error {
 	if session.Status == db.SessionStatusQuestionCycle && session.Grade == "джун" {
 		grade, ok := normalizeTargetGrade(c.Data())
 		if !ok {
-			return c.Send("Для тренировки выбери целевой грейд: мидл или сеньор.", targetGradeMenu)
+			return c.Send("Для тренировки выберите целевой грейд: мидл или сеньор.", targetGradeMenu)
 		}
 		if err := h.repo.UpdateLegacyTargetGrade(ctx, session.ID, grade); err != nil {
 			h.logger.Error("update legacy target grade", "error", err, "session_id", session.ID)
@@ -736,7 +736,7 @@ func (h *Handler) handleRestartCallback(c tele.Context) error {
 	defer cancel()
 	student, err := h.repo.GetStudentByTelegramID(ctx, telegramID)
 	if errors.Is(err, db.ErrStudentNotFound) {
-		return c.Send("Похоже, ты еще не зарегистрирован. Напиши /start и код доступа, который тебе прислали.")
+		return c.Send("Похоже, вы еще не зарегистрированы. Напишите /start и код доступа, который вам прислали.")
 	}
 	if err != nil {
 		h.logger.Error("get student", "error", err)
@@ -780,7 +780,7 @@ func (h *Handler) handleContinueCallback(c tele.Context) error {
 	defer cancel()
 	student, err := h.repo.GetStudentByTelegramID(ctx, telegramID)
 	if errors.Is(err, db.ErrStudentNotFound) {
-		return c.Send("Похоже, ты еще не зарегистрирован. Напиши /start и код доступа, который тебе прислали.")
+		return c.Send("Похоже, вы еще не зарегистрированы. Напишите /start и код доступа, который вам прислали.")
 	}
 	if err != nil {
 		h.logger.Error("get student", "error", err)
@@ -789,7 +789,7 @@ func (h *Handler) handleContinueCallback(c tele.Context) error {
 
 	session, err := h.repo.GetActiveSession(ctx, student.TelegramID)
 	if errors.Is(err, db.ErrNoActiveSession) {
-		return c.Send("Активной сессии уже нет. Напиши /start и код доступа, чтобы начать заново.")
+		return c.Send("Активной сессии уже нет. Напишите /start и код доступа, чтобы начать заново.")
 	}
 	if err != nil {
 		h.logger.Error("get active session", "error", err)
@@ -815,7 +815,7 @@ func (h *Handler) handleMessage(c tele.Context) error {
 
 	student, err := h.repo.GetStudentByTelegramID(ctx, telegramID)
 	if errors.Is(err, db.ErrStudentNotFound) {
-		return c.Send("Похоже, ты еще не зарегистрирован. Напиши /start и код доступа, который тебе прислали.")
+		return c.Send("Похоже, вы еще не зарегистрированы. Напишите /start и код доступа, который вам прислали.")
 	}
 	if err != nil {
 		h.logger.Error("get student", "error", err)
@@ -824,7 +824,7 @@ func (h *Handler) handleMessage(c tele.Context) error {
 
 	session, err := h.repo.GetActiveSession(ctx, student.TelegramID)
 	if errors.Is(err, db.ErrNoActiveSession) {
-		return c.Send("Активной сессии нет. Напиши /start и код доступа, чтобы начать.")
+		return c.Send("Активной сессии нет. Напишите /start и код доступа, чтобы начать.")
 	}
 	if err != nil {
 		h.logger.Error("get active session", "error", err)
@@ -837,7 +837,7 @@ func (h *Handler) handleMessage(c tele.Context) error {
 	case db.SessionStatusProfileConfirmation:
 		return sendQualificationConfirmation(c, session)
 	case db.SessionStatusKDIRLesson:
-		return c.Send("Когда будешь готов, нажми кнопку.", readyMenu)
+		return c.Send("Когда будете готовы, нажмите кнопку.", readyMenu)
 	case db.SessionStatusAudit:
 		return h.handleAudit(ctx, c, student, session)
 	case db.SessionStatusQuestionCycle:
@@ -948,7 +948,7 @@ func normalizeGradeForStep(value string, step int) (string, bool) {
 }
 
 func gradeChoiceMessage(step int, button bool) string {
-	prefix := "Выбери грейд"
+	prefix := "Выберите грейд"
 	if button {
 		prefix += " кнопкой"
 	}
@@ -968,7 +968,7 @@ func gradeMenuForStep(step int) *tele.ReplyMarkup {
 func formatQualificationSummary(session *db.Session) string {
 	strongZones := formatProfileList(session.StrongZones)
 	weakZones := formatProfileList(session.WeakZonesInput)
-	return fmt.Sprintf(`Зафиксировала твои ответы. Правильно ли я понимаю?
+	return fmt.Sprintf(`Зафиксировала ваши ответы. Правильно ли я понимаю?
 
 Текущий грейд: %s
 Целевой грейд: %s
@@ -1077,7 +1077,7 @@ func (h *Handler) handleConfirmProfileCallback(c tele.Context) error {
 
 	student, err := h.repo.GetStudentByTelegramID(ctx, telegramID)
 	if errors.Is(err, db.ErrStudentNotFound) {
-		return c.Send("Похоже, ты еще не зарегистрирован. Напиши /start и код доступа, который тебе прислали.")
+		return c.Send("Похоже, вы еще не зарегистрированы. Напишите /start и код доступа, который вам прислали.")
 	}
 	if err != nil {
 		h.logger.Error("get student", "error", err)
@@ -1199,7 +1199,7 @@ func (h *Handler) resumeCurrentStep(ctx context.Context, c tele.Context, session
 	case db.SessionStatusKDIRLesson:
 		return h.sendKDIRLesson(c, session.ID)
 	default:
-		return c.Send("Хорошо, продолжаем с того места, где остановились. Пиши следующее сообщение.")
+		return c.Send("Хорошо, продолжаем с того места, где остановились. Напишите следующее сообщение.")
 	}
 }
 
@@ -1293,7 +1293,7 @@ func (h *Handler) handleQuestionCycle(ctx context.Context, c tele.Context, stude
 	case db.QuestionAttemptWaitingVector:
 		question, questionErr := h.repo.GetQuestionByID(ctx, attempt.QuestionID)
 		if questionErr != nil {
-			return c.Send("Выбери кнопкой, куда двигаться в следующем цикле.", vectorMenu)
+			return c.Send("Выберите кнопкой, куда двигаться в следующем цикле.", vectorMenu)
 		}
 		return h.sendVectorChoice(c, session, question)
 	default:
@@ -1310,7 +1310,7 @@ func (h *Handler) handleQuestionCycle(ctx context.Context, c tele.Context, stude
 func (h *Handler) askNextQuestion(ctx context.Context, c tele.Context, student *db.Student, session *db.Session) error {
 	grade := session.Grade
 	if grade == "джун" {
-		return c.Send("Целевой уровень «Джун» больше не используется. Выбери, на какой уровень продолжить тренировку: мидл или сеньор.", targetGradeMenu)
+		return c.Send("Целевой уровень «Джун» больше не используется. Выберите, на каком уровне продолжить тренировку: мидл или сеньор.", targetGradeMenu)
 	}
 	if grade == "" {
 		h.logger.Warn("question cycle started without a captured grade, using fallback",
@@ -1375,19 +1375,19 @@ func formatPrimaryQuestion(question *db.QuestionBank, first bool) string {
 	}
 	contextText := strings.TrimSpace(question.QuestionContext)
 	if contextText == "" {
-		contextText = "Представь, что это вопрос с технического собеседования системного аналитика."
+		contextText = "Представьте, что это вопрос с технического собеседования системного аналитика."
 	}
-	return fmt.Sprintf("%s\n\n%s\n\n<b>%s</b>\n\nОтветь текстом своими словами. Если удобно, используй КДИР, чтобы структурировать ответ. Я разберу его и сразу дам обратную связь.",
+	return fmt.Sprintf("%s\n\n%s\n\n<b>%s</b>\n\nОтветьте текстом своими словами. Если удобно, используйте КДИР, чтобы структурировать ответ. Я разберу его и сразу дам обратную связь.",
 		html.EscapeString(lead), html.EscapeString(contextText), html.EscapeString(strings.TrimSpace(question.QuestionText)))
 }
 
 func formatFollowupQuestion(contextText, questionText string, number int) string {
 	contextText = strings.TrimSpace(contextText)
 	if contextText == "" {
-		contextText = "Интервьюер хочет проверить, как ты применишь ответ на практике."
+		contextText = "Интервьюер хочет проверить, как вы примените ответ на практике."
 	}
 	questionText = capitalizeFirst(strings.TrimSpace(questionText))
-	return fmt.Sprintf("Теперь уточняющий вопрос %d из 2.\n\n%s\n\n<b>%s</b>\n\nОтвечай своими словами. При желании используй КДИР как подсказку для структуры.",
+	return fmt.Sprintf("Теперь уточняющий вопрос %d из 2.\n\n%s\n\n<b>%s</b>\n\nОтвечайте своими словами. При желании используйте КДИР как подсказку для структуры.",
 		number, html.EscapeString(contextText), html.EscapeString(questionText))
 }
 
@@ -1463,7 +1463,7 @@ func (h *Handler) evaluatePrimaryAnswer(ctx context.Context, c tele.Context, stu
 		followupContext = question.Followup2Context
 	}
 	if strings.TrimSpace(followup) == "" {
-		followup = "Приведи конкретный пример и объясни, почему выбрал именно такой подход."
+		followup = "Приведите конкретный пример и объясните, почему выбрали именно такой подход."
 	}
 	followup = formatFollowupQuestion(followupContext, followup, 1)
 
@@ -1527,7 +1527,7 @@ func (h *Handler) evaluateFollowupAnswer(ctx context.Context, c tele.Context, st
 
 	followup2 := strings.TrimSpace(question.Followup2)
 	if followup2 == "" {
-		followup2 = "Какой конкретный результат получился и как ты понял, что выбранный подход сработал?"
+		followup2 = "Какой конкретный результат получился и как вы поняли, что выбранный подход сработал?"
 	}
 	followup2 = formatFollowupQuestion(question.Followup2Context, followup2, 2)
 	feedback := normalizeFeedbackHeadingSpacing(reply.Text)
@@ -1632,7 +1632,7 @@ func (h *Handler) deliverFinalFeedback(ctx context.Context, c tele.Context, stud
 
 func (h *Handler) sendVectorChoice(c tele.Context, session *db.Session, question *db.QuestionBank) error {
 	if h.sessionCycleLimit > 0 && session.CycleCount > 0 && session.CycleCount%h.sessionCycleLimit == 0 {
-		return c.Send("Хочешь продолжить тренировку?", buildCheckpointMenu())
+		return c.Send("Хотите продолжить тренировку?", buildCheckpointMenu())
 	}
 	return c.Send("Куда двигаемся в следующем блоке?", buildVectorMenu(session.WeakTopics, question.Topic))
 }
@@ -1681,7 +1681,7 @@ func (h *Handler) handleVectorCallback(c tele.Context) error {
 		nextTopic = "*"
 	case "topic":
 		if len(parts) != 2 || !validTopics[strings.ToLower(parts[1])] {
-			return c.Send("Выбери один из предложенных вариантов.", vectorMenu)
+			return c.Send("Выберите один из предложенных вариантов.", vectorMenu)
 		}
 		nextTopic = strings.ToLower(parts[1])
 	case "deepen":
@@ -1694,7 +1694,7 @@ func (h *Handler) handleVectorCallback(c tele.Context) error {
 	case "random":
 		nextTopic = "*"
 	default:
-		return c.Send("Выбери один из предложенных вариантов.", vectorMenu)
+		return c.Send("Выберите один из предложенных вариантов.", vectorMenu)
 	}
 
 	if err := h.repo.CompleteQuestionAttempt(ctx, session.ID, attempt.ID, selectedVector, nextTopic); err != nil {
@@ -1727,7 +1727,7 @@ func (h *Handler) handleReturnToQuestionsCallback(c tele.Context) error {
 	}
 	attempt, err := h.repo.GetActiveQuestionAttempt(ctx, session.ID)
 	if err != nil || attempt.Status != db.QuestionAttemptWaitingVector {
-		return c.Send("Вернуться не получится: подходящие вопросы в банке закончились. Чтобы начать заново, отправь /start и свой код.")
+		return c.Send("Вернуться не получится: подходящие вопросы в банке закончились. Чтобы начать заново, отправьте /start и свой код.")
 	}
 	question, err := h.repo.GetQuestionByID(ctx, attempt.QuestionID)
 	if err != nil {
@@ -1812,7 +1812,7 @@ func (h *Handler) runSummary(ctx context.Context, c tele.Context, student *db.St
 	if err != nil {
 		h.logger.Error("llm reply (summary)", "error", err, "session_id", session.ID)
 		return h.sendSavedSummary(ctx, c, student, session,
-			"Не получилось сформировать подробный итог из-за временной ошибки. Твои ответы и прогресс сохранены. Попробуй завершить тренировку ещё раз позже.")
+			"Не получилось сформировать подробный итог из-за временной ошибки. Ваши ответы и прогресс сохранены. Попробуйте завершить тренировку ещё раз позже.")
 	}
 	h.saveLLMUsage(ctx, student.TelegramID, session.ID, llmOperationSummary, reply)
 
@@ -1825,7 +1825,7 @@ func (h *Handler) runSummary(ctx context.Context, c tele.Context, student *db.St
 }
 
 func (h *Handler) sendSavedSummary(ctx context.Context, c tele.Context, student *db.Student, session *db.Session, summary string) error {
-	message := fmt.Sprintf("%s\n\nЕсли хочешь начать с самого начала, отправь /start %s", strings.TrimSpace(summary), student.AccessCode)
+	message := fmt.Sprintf("%s\n\nЕсли хотите начать с самого начала, отправьте /start %s", strings.TrimSpace(summary), student.AccessCode)
 	attempt, err := h.repo.GetActiveQuestionAttempt(ctx, session.ID)
 	if err == nil && attempt.Status == db.QuestionAttemptWaitingVector {
 		return sendText(c, message, summaryMenu)
@@ -2127,7 +2127,7 @@ func splitBlockFeedback(text string) (mini, full string) {
 	text = strings.TrimSpace(text)
 	loc := bigFeedbackHeadingRE.FindStringIndex(text)
 	if loc == nil {
-		return text, "▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ\nМодель не разделила мини-разбор и общий разбор блока. Ответ выше сохранён целиком; попробуй следующий блок."
+		return text, "▸ БОЛЬШАЯ ОБРАТНАЯ СВЯЗЬ\nМодель не разделила мини-разбор и общий разбор блока. Ответ выше сохранён целиком; попробуйте следующий блок."
 	}
 	mini = strings.TrimSpace(text[:loc[0]])
 	full = strings.TrimSpace(text[loc[0]:])

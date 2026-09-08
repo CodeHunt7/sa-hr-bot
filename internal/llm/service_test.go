@@ -64,6 +64,8 @@ func TestNewService_SubstitutesSessionCycleLimit(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Ты живой интервьюер и наставник",
+		"Обращение к кандидату только на \"вы\"",
+		"вы указали",
 		"не единственно правильными",
 		"КДИР является рекомендацией",
 		"Существенного пробела по этому вопросу нет",
@@ -78,6 +80,9 @@ func TestNewService_SubstitutesSessionCycleLimit(t *testing.T) {
 	}
 	if strings.Contains(svc.systemPrompt, "есть в ответе, один главный пробел") {
 		t.Fatal("systemPrompt still requires a gap in every answer")
+	}
+	if strings.Contains(svc.systemPrompt, "Говори на \"ты\"") || strings.Contains(svc.systemPrompt, "Обращение на \"ты\"") {
+		t.Fatal("systemPrompt still instructs the model to address the candidate informally")
 	}
 }
 
@@ -303,6 +308,7 @@ func TestEvaluate_SendsQuestionAndReferenceAnswersAsContext(t *testing.T) {
 		studentAnswer, "middle-ref", "Что такое индекс в БД?",
 		"ФАЗА 3", "Не начинай квалификацию", "Не спрашивай грейд", "ответ бессмысленный",
 		"живой интервьюер и наставник", "не единственно правильным вариантом",
+		"Обращайся к кандидату только на `вы`", "вы указали", "вы ответили",
 		"Существенного пробела по этому вопросу нет", "Не выдумывай недостаток",
 		"КДИР является рекомендацией", "Целевой уровень: мидл",
 	} {

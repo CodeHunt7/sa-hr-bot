@@ -27,6 +27,7 @@ jobs:
 
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/sahrbot_test?sslmode=disable
+      RUN_DB_INTEGRATION_TESTS: "1"
       TELEGRAM_BOT_TOKEN: test-token-not-used
       OPENAI_API_KEY: test-key-not-used
 

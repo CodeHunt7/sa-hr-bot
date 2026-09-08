@@ -62,6 +62,8 @@ const (
 
 const genericErrorMessage = "Что-то сломалось на моей стороне. Попробуйте написать еще раз через минуту."
 
+const accessExpiredMessage = "Срок доступа закончился. Чтобы продлить его ещё на два месяца, отправьте /start НОВЫЙ_КОД"
+
 const telegramTextChunkLimit = 3900
 
 const (
@@ -77,7 +79,7 @@ const (
 
 	instructionMessage = `Привет. Меня зовут Катя Желатинка, я собрала для вас тренажёр для отработки технических собеседований системного аналитика.
 
-Это не чат-бот общего назначения. Под капотом этого ИИ-агента собраны 174 вопроса: 58 основных и 116 уточняющих. Их задают на собесах в 2026 году.
+Это не чат-бот общего назначения. Под капотом этого ИИ-агента собраны 174 вопроса, которые задают на собесах в 2026 году.
 
 Формат простой: сначала 4 коротких вопроса о вас, чтобы лучше понять ваш запрос. Дальше цикл вопросов с разбором каждого ответа. Фидбек вы получаете сразу, без ожидания.
 
@@ -206,6 +208,7 @@ func init() {
 // Repository is the subset of db.Repository this package depends on.
 type Repository interface {
 	CreateStudentIfAccessCodeValid(ctx context.Context, telegramID int64, name, code string) (*db.Student, error)
+	RenewStudentAccessWithCode(ctx context.Context, telegramID int64, code string) (*db.Student, error)
 	GetStudentByTelegramID(ctx context.Context, telegramID int64) (*db.Student, error)
 	GetActiveSession(ctx context.Context, studentID int64) (*db.Session, error)
 	StartSession(ctx context.Context, studentID int64) (*db.Session, error)
@@ -339,7 +342,67 @@ func (h *Handler) Register(bot *tele.Bot) {
 // exact call, so there is no ordering to get wrong and no way for an
 // endpoint registered through this helper to accidentally skip it.
 func (h *Handler) handle(bot *tele.Bot, endpoint interface{}, fn tele.HandlerFunc) {
-	bot.Handle(endpoint, h.trackHandler(fn), h.recoverMiddleware)
+	bot.Handle(endpoint, h.trackHandler(h.requireActiveAccess(fn)), h.recoverMiddleware)
+}
+
+// requireActiveAccess is the single gate for every participant-facing
+// command, callback and text message. Admins remain able to manage codes even
+// if they do not have participant access. /start is allowed through so an
+// expired participant can activate a new code.
+func (h *Handler) requireActiveAccess(next tele.HandlerFunc) tele.HandlerFunc {
+	return func(c tele.Context) error {
+		if isStartCommand(c.Text()) || (h.isAdmin(c) && isAdminCommand(c.Text())) {
+			return next(c)
+		}
+
+		telegramID := senderID(c)
+		if telegramID == 0 {
+			return next(c)
+		}
+		ctx, cancel := newHandlerContext()
+		defer cancel()
+		student, err := h.repo.GetStudentByTelegramID(ctx, telegramID)
+		if errors.Is(err, db.ErrStudentNotFound) {
+			return next(c)
+		}
+		if err != nil {
+			h.logger.Error("check student access", "error", err, "telegram_id", telegramID)
+			return c.Send(genericErrorMessage)
+		}
+		if isAccessExpired(student, time.Now()) {
+			if c.Callback() != nil {
+				_ = c.Respond()
+			}
+			return c.Send(accessExpiredMessage)
+		}
+		return next(c)
+	}
+}
+
+func isAdminCommand(text string) bool {
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return false
+	}
+	command := strings.ToLower(strings.SplitN(fields[0], "@", 2)[0])
+	switch command {
+	case "/admin", "/code", "/codes", "/delete_code", "/tokens", "/report":
+		return true
+	default:
+		return false
+	}
+}
+
+func isStartCommand(text string) bool {
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return false
+	}
+	return strings.EqualFold(strings.SplitN(fields[0], "@", 2)[0], "/start")
+}
+
+func isAccessExpired(student *db.Student, now time.Time) bool {
+	return student != nil && !student.AccessExpiresAt.IsZero() && !now.Before(student.AccessExpiresAt)
 }
 
 // trackHandler lets shutdown stop accepting newly scheduled handlers and wait
@@ -575,10 +638,14 @@ func (h *Handler) handleStart(c tele.Context) error {
 		return c.Send(genericErrorMessage)
 	}
 
+	if isAccessExpired(student, time.Now()) {
+		return h.renewExpiredAccess(ctx, c, student)
+	}
+
 	// A registered student can use the same personal code shown in the final
 	// message to explicitly start over. The old session and all its answers stay
 	// in PostgreSQL as ABANDONED history; only a fresh active session is created.
-	if len(c.Args()) > 0 && strings.TrimSpace(c.Args()[0]) == student.AccessCode {
+	if len(c.Args()) > 0 && strings.EqualFold(strings.TrimSpace(c.Args()[0]), student.AccessCode) {
 		session, sessionErr := h.repo.GetActiveSession(ctx, student.TelegramID)
 		if sessionErr == nil {
 			if endErr := h.repo.EndSession(ctx, session.ID, db.SessionStatusAbandoned); endErr != nil {
@@ -607,6 +674,42 @@ func (h *Handler) handleStart(c tele.Context) error {
 	}
 }
 
+func (h *Handler) renewExpiredAccess(ctx context.Context, c tele.Context, student *db.Student) error {
+	args := c.Args()
+	if len(args) != 1 {
+		return c.Send(accessExpiredMessage)
+	}
+	code := strings.ToUpper(strings.TrimSpace(args[0]))
+	if code == "" || code == strings.ToUpper(student.AccessCode) {
+		return c.Send("Этот код уже использован и его срок закончился. Для продления нужен новый код доступа.")
+	}
+
+	renewed, err := h.repo.RenewStudentAccessWithCode(ctx, student.TelegramID, code)
+	if errors.Is(err, db.ErrAccessCodeInvalid) {
+		return c.Send("Новый код не подходит. Проверьте, что он скопирован без пробелов и ещё не использован.")
+	}
+	if err != nil {
+		h.logger.Error("renew expired student access", "error", err, "telegram_id", student.TelegramID)
+		return c.Send(genericErrorMessage)
+	}
+
+	session, err := h.repo.GetActiveSession(ctx, renewed.TelegramID)
+	if errors.Is(err, db.ErrNoActiveSession) {
+		if sendErr := c.Send(fmt.Sprintf("Доступ продлён до %s. Начинаем новую тренировку.", formatAccessDate(renewed.AccessExpiresAt))); sendErr != nil {
+			return sendErr
+		}
+		return h.startFreshSession(ctx, c, renewed)
+	}
+	if err != nil {
+		h.logger.Error("get active session after access renewal", "error", err, "telegram_id", renewed.TelegramID)
+		return c.Send(genericErrorMessage)
+	}
+	if err := c.Send(fmt.Sprintf("Доступ продлён до %s. Продолжаем с сохранённого места.", formatAccessDate(renewed.AccessExpiresAt))); err != nil {
+		return err
+	}
+	return h.resumeCurrentStep(ctx, c, session)
+}
+
 // registerAndStart validates the access code from "/start CODE" and, on
 // success, registers the student and starts their first session.
 func (h *Handler) registerAndStart(ctx context.Context, c tele.Context, telegramID int64) error {
@@ -614,7 +717,7 @@ func (h *Handler) registerAndStart(ctx context.Context, c tele.Context, telegram
 	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
 		return c.Send("Чтобы начать, напишите /start и код доступа через пробел, например /start SA2026-ABCD")
 	}
-	code := strings.TrimSpace(args[0])
+	code := strings.ToUpper(strings.TrimSpace(args[0]))
 
 	student, err := h.repo.CreateStudentIfAccessCodeValid(ctx, telegramID, displayName(c.Sender()), code)
 	switch {
@@ -1857,10 +1960,10 @@ func (h *Handler) handleAdminHelp(c tele.Context) error {
 	}
 	return c.Send(`Команды администратора:
 /code [количество] — создать от 1 до 20 кодов
-/codes — показать все свободные и занятые коды
+/codes — показать свободные, активные и истёкшие коды
 /delete_code КОД — удалить неиспользованный код
-/tokens КОД — показать расход токенов пользователя
-/report — показать пользователей, их коды и расход токенов
+/tokens КОД — показать срок доступа и расход токенов пользователя
+/report — показать пользователей, сроки доступа, коды и расход токенов
 
 Использованный код удалить нельзя: к нему привязаны пользователь и история тренировок.`)
 }
@@ -1916,8 +2019,14 @@ func (h *Handler) handleListCodes(c tele.Context) error {
 			fmt.Fprintf(&b, "%s — свободен\n", report.Code)
 			continue
 		}
-		fmt.Fprintf(&b, "%s — занят\n", report.Code)
+		fmt.Fprintf(&b, "%s — %s\n", report.Code, accessCodeStatus(report, time.Now()))
 		fmt.Fprintf(&b, "%s, Telegram ID: %d\n", report.StudentName, *report.StudentID)
+		if report.ActivatedAt != nil {
+			fmt.Fprintf(&b, "Активирован: %s\n", formatAccessDate(*report.ActivatedAt))
+		}
+		if report.ExpiresAt != nil {
+			fmt.Fprintf(&b, "Доступ до: %s\n", formatAccessDate(*report.ExpiresAt))
+		}
 		fmt.Fprintf(&b, "Токены: %d\n", report.TotalTokens)
 	}
 	return sendText(c, b.String())
@@ -1969,10 +2078,21 @@ func (h *Handler) handleTokenUsage(c tele.Context) error {
 		return c.Send(fmt.Sprintf("Код: %s\nСтатус: не использован\nРасход токенов: 0", report.Code))
 	}
 	return c.Send(fmt.Sprintf(
-		"Код: %s\nПользователь: %s\nTelegram ID: %d\nВызовов модели: %d\nВходные токены: %d\nВыходные токены: %d\nВсего токенов: %d\nИз них кэшировано: %d",
-		report.Code, report.StudentName, *report.StudentID, report.Calls,
+		"Код: %s\nСтатус: %s\nАктивирован: %s\nДоступ до: %s\nПользователь: %s\nTelegram ID: %d\nВызовов модели: %d\nВходные токены: %d\nВыходные токены: %d\nВсего токенов: %d\nИз них кэшировано: %d",
+		report.Code, accessCodeStatus(*report, time.Now()), formatOptionalAccessDate(report.ActivatedAt),
+		formatOptionalAccessDate(report.ExpiresAt), report.StudentName, *report.StudentID, report.Calls,
 		report.PromptTokens, report.CompletionTokens, report.TotalTokens, report.CachedTokens,
 	))
+}
+
+func accessCodeStatus(report db.TokenUsageReport, now time.Time) string {
+	if !report.IsUsed || report.StudentID == nil {
+		return "свободен"
+	}
+	if report.ExpiresAt != nil && !now.Before(*report.ExpiresAt) {
+		return "истёк"
+	}
+	return "активен"
 }
 
 // handleReport is an admin-only export of every registered student:
@@ -2027,6 +2147,7 @@ func formatReportText(reports []db.StudentReport) string {
 		fmt.Fprintf(&b, "telegram_id: %d\n", rep.TelegramID)
 		fmt.Fprintf(&b, "Имя: %s\n", rep.Name)
 		fmt.Fprintf(&b, "Код: %s\n", rep.AccessCode)
+		fmt.Fprintf(&b, "Доступ: %s, до %s\n", studentAccessStatus(rep, time.Now()), formatAccessDate(rep.AccessExpiresAt))
 		fmt.Fprintf(&b, "Завершенных сессий: %d\n", rep.CompletedSessions)
 		fmt.Fprintf(&b, "Последняя сессия: %s\n", formatReportDate(rep.LastSessionAt))
 		fmt.Fprintf(&b, "Токены: %d (вход: %d, выход: %d, кэш: %d; вызовов: %d)\n",
@@ -2046,7 +2167,7 @@ func writeReportCSV(reports []db.StudentReport) (string, error) {
 
 	w := csv.NewWriter(f)
 	if err := w.Write([]string{
-		"telegram_id", "name", "access_code", "completed_sessions", "last_session_at",
+		"telegram_id", "name", "access_code", "access_activated_at", "access_expires_at", "access_status", "completed_sessions", "last_session_at",
 		"llm_calls", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens",
 	}); err != nil {
 		return "", fmt.Errorf("write csv header: %w", err)
@@ -2056,6 +2177,9 @@ func writeReportCSV(reports []db.StudentReport) (string, error) {
 			strconv.FormatInt(rep.TelegramID, 10),
 			rep.Name,
 			rep.AccessCode,
+			formatAccessDate(rep.AccessActivatedAt),
+			formatAccessDate(rep.AccessExpiresAt),
+			studentAccessStatus(rep, time.Now()),
 			strconv.Itoa(rep.CompletedSessions),
 			formatReportDate(rep.LastSessionAt),
 			strconv.FormatInt(rep.Calls, 10),
@@ -2083,6 +2207,27 @@ func formatReportDate(t *time.Time) string {
 		return "нет"
 	}
 	return t.Format("2006-01-02 15:04")
+}
+
+func formatAccessDate(t time.Time) string {
+	if t.IsZero() {
+		return "нет"
+	}
+	return t.Format("02.01.2006")
+}
+
+func formatOptionalAccessDate(t *time.Time) string {
+	if t == nil {
+		return "нет"
+	}
+	return formatAccessDate(*t)
+}
+
+func studentAccessStatus(report db.StudentReport, now time.Time) string {
+	if !report.AccessExpiresAt.IsZero() && !now.Before(report.AccessExpiresAt) {
+		return "истёк"
+	}
+	return "активен"
 }
 
 // extractWeakTopics pulls the WEAK_TOPICS: marker line (see

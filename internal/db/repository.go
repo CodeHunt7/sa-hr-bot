@@ -177,6 +177,7 @@ func (r *Repository) GetTokenUsageByAccessCode(ctx context.Context, code string)
 	report := &TokenUsageReport{}
 	err := r.pool.QueryRow(ctx,
 		`SELECT ac.code, ac.is_used, ac.student_id, COALESCE(s.name, ''),
+		        ac.activated_at, ac.expires_at,
 		        COUNT(u.id), COALESCE(SUM(u.prompt_tokens), 0),
 		        COALESCE(SUM(u.completion_tokens), 0), COALESCE(SUM(u.total_tokens), 0),
 		        COALESCE(SUM(u.cached_tokens), 0)
@@ -184,10 +185,11 @@ func (r *Repository) GetTokenUsageByAccessCode(ctx context.Context, code string)
 		 LEFT JOIN students s ON s.telegram_id = ac.student_id
 		 LEFT JOIN llm_usage u ON u.student_id = ac.student_id
 		 WHERE ac.code = $1
-		 GROUP BY ac.code, ac.is_used, ac.student_id, s.name`,
+		 GROUP BY ac.code, ac.is_used, ac.student_id, s.name, ac.activated_at, ac.expires_at`,
 		code,
 	).Scan(
 		&report.Code, &report.IsUsed, &report.StudentID, &report.StudentName,
+		&report.ActivatedAt, &report.ExpiresAt,
 		&report.Calls, &report.PromptTokens, &report.CompletionTokens,
 		&report.TotalTokens, &report.CachedTokens,
 	)
@@ -206,13 +208,14 @@ func (r *Repository) GetTokenUsageByAccessCode(ctx context.Context, code string)
 func (r *Repository) ListAccessCodes(ctx context.Context) ([]TokenUsageReport, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT ac.code, ac.is_used, ac.student_id, COALESCE(s.name, ''),
+		        ac.activated_at, ac.expires_at,
 		        COUNT(u.id), COALESCE(SUM(u.prompt_tokens), 0),
 		        COALESCE(SUM(u.completion_tokens), 0), COALESCE(SUM(u.total_tokens), 0),
 		        COALESCE(SUM(u.cached_tokens), 0)
 		 FROM access_codes ac
 		 LEFT JOIN students s ON s.telegram_id = ac.student_id
 		 LEFT JOIN llm_usage u ON u.student_id = ac.student_id
-		 GROUP BY ac.code, ac.is_used, ac.student_id, s.name
+		 GROUP BY ac.code, ac.is_used, ac.student_id, s.name, ac.activated_at, ac.expires_at
 		 ORDER BY ac.is_used, ac.code`,
 	)
 	if err != nil {
@@ -225,6 +228,7 @@ func (r *Repository) ListAccessCodes(ctx context.Context) ([]TokenUsageReport, e
 		var report TokenUsageReport
 		if err := rows.Scan(
 			&report.Code, &report.IsUsed, &report.StudentID, &report.StudentName,
+			&report.ActivatedAt, &report.ExpiresAt,
 			&report.Calls, &report.PromptTokens, &report.CompletionTokens,
 			&report.TotalTokens, &report.CachedTokens,
 		); err != nil {
@@ -279,10 +283,16 @@ func (r *Repository) CreateStudentIfAccessCodeValid(ctx context.Context, telegra
 		return nil, fmt.Errorf("insert student: %w", err)
 	}
 
-	if _, err := tx.Exec(ctx,
-		`UPDATE access_codes SET is_used = true, student_id = $1 WHERE code = $2`,
+	if err := tx.QueryRow(ctx,
+		`UPDATE access_codes
+		 SET is_used = true,
+		     student_id = $1,
+		     activated_at = now(),
+		     expires_at = now() + INTERVAL '2 months'
+		 WHERE code = $2
+		 RETURNING activated_at, expires_at`,
 		telegramID, code,
-	); err != nil {
+	).Scan(&student.AccessActivatedAt, &student.AccessExpiresAt); err != nil {
 		return nil, fmt.Errorf("mark access code used: %w", err)
 	}
 
@@ -290,6 +300,71 @@ func (r *Repository) CreateStudentIfAccessCodeValid(ctx context.Context, telegra
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
+	return student, nil
+}
+
+// RenewStudentAccessWithCode consumes a new one-time code for an existing
+// student and makes it their current access code. The student row is locked
+// first so concurrent renewal attempts cannot consume multiple codes.
+func (r *Repository) RenewStudentAccessWithCode(ctx context.Context, telegramID int64, code string) (*Student, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("renew access begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	student := &Student{}
+	err = tx.QueryRow(ctx,
+		`SELECT telegram_id, name, access_code, created_at
+		 FROM students
+		 WHERE telegram_id = $1
+		 FOR UPDATE`,
+		telegramID,
+	).Scan(&student.TelegramID, &student.Name, &student.AccessCode, &student.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrStudentNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock student for access renewal: %w", err)
+	}
+
+	var isUsed bool
+	err = tx.QueryRow(ctx,
+		`SELECT is_used FROM access_codes WHERE code = $1 FOR UPDATE`,
+		code,
+	).Scan(&isUsed)
+	if errors.Is(err, pgx.ErrNoRows) || isUsed {
+		return nil, ErrAccessCodeInvalid
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock renewal access code: %w", err)
+	}
+
+	err = tx.QueryRow(ctx,
+		`UPDATE access_codes
+		 SET is_used = true,
+		     student_id = $1,
+		     activated_at = now(),
+		     expires_at = now() + INTERVAL '2 months'
+		 WHERE code = $2
+		 RETURNING activated_at, expires_at`,
+		telegramID, code,
+	).Scan(&student.AccessActivatedAt, &student.AccessExpiresAt)
+	if err != nil {
+		return nil, fmt.Errorf("activate renewal access code: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE students SET access_code = $1 WHERE telegram_id = $2`,
+		code, telegramID,
+	); err != nil {
+		return nil, fmt.Errorf("set current student access code: %w", err)
+	}
+	student.AccessCode = code
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("renew access commit: %w", err)
+	}
 	return student, nil
 }
 
@@ -330,9 +405,14 @@ func (r *Repository) StartSession(ctx context.Context, studentID int64) (*Sessio
 func (r *Repository) GetStudentByTelegramID(ctx context.Context, telegramID int64) (*Student, error) {
 	s := &Student{}
 	err := r.pool.QueryRow(ctx,
-		`SELECT telegram_id, name, access_code, created_at FROM students WHERE telegram_id = $1`,
+		`SELECT s.telegram_id, s.name, s.access_code, s.created_at,
+		        ac.activated_at, ac.expires_at
+		 FROM students s
+		 JOIN access_codes ac ON ac.code = s.access_code
+		 WHERE s.telegram_id = $1`,
 		telegramID,
-	).Scan(&s.TelegramID, &s.Name, &s.AccessCode, &s.CreatedAt)
+	).Scan(&s.TelegramID, &s.Name, &s.AccessCode, &s.CreatedAt,
+		&s.AccessActivatedAt, &s.AccessExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrStudentNotFound
 	}
@@ -1073,11 +1153,13 @@ func (r *Repository) GetSessionAttemptReports(ctx context.Context, sessionID int
 func (r *Repository) GetStudentReports(ctx context.Context) ([]StudentReport, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT s.telegram_id, s.name, s.access_code,
+		        ac.activated_at, ac.expires_at,
 		        COALESCE(sess.completed_sessions, 0), sess.last_session_at,
 		        COALESCE(usage.calls, 0), COALESCE(usage.prompt_tokens, 0),
 		        COALESCE(usage.completion_tokens, 0), COALESCE(usage.total_tokens, 0),
 		        COALESCE(usage.cached_tokens, 0)
 		 FROM students s
+		 JOIN access_codes ac ON ac.code = s.access_code
 		 LEFT JOIN (
 		     SELECT student_id,
 		            COUNT(*) FILTER (WHERE status = $1) AS completed_sessions,
@@ -1106,6 +1188,7 @@ func (r *Repository) GetStudentReports(ctx context.Context) ([]StudentReport, er
 		var rep StudentReport
 		if err := rows.Scan(
 			&rep.TelegramID, &rep.Name, &rep.AccessCode,
+			&rep.AccessActivatedAt, &rep.AccessExpiresAt,
 			&rep.CompletedSessions, &rep.LastSessionAt, &rep.Calls,
 			&rep.PromptTokens, &rep.CompletionTokens, &rep.TotalTokens, &rep.CachedTokens,
 		); err != nil {

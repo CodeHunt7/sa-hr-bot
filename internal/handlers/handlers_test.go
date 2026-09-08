@@ -34,10 +34,11 @@ func newCapturingLogger() (*slog.Logger, *bytes.Buffer) {
 // fine since handlers.go never calls them.
 type fakeContext struct {
 	tele.Context
-	sender *tele.User
-	text   string
-	args   []string
-	data   string
+	sender   *tele.User
+	text     string
+	args     []string
+	data     string
+	callback *tele.Callback
 
 	sent         []string
 	sentEvents   []string
@@ -49,10 +50,11 @@ type fakeContext struct {
 	responded    bool
 }
 
-func (f *fakeContext) Sender() *tele.User { return f.sender }
-func (f *fakeContext) Text() string       { return f.text }
-func (f *fakeContext) Args() []string     { return f.args }
-func (f *fakeContext) Data() string       { return f.data }
+func (f *fakeContext) Sender() *tele.User       { return f.sender }
+func (f *fakeContext) Text() string             { return f.text }
+func (f *fakeContext) Args() []string           { return f.args }
+func (f *fakeContext) Data() string             { return f.data }
+func (f *fakeContext) Callback() *tele.Callback { return f.callback }
 
 func (f *fakeContext) Send(what interface{}, options ...interface{}) error {
 	f.sentOptions = append(f.sentOptions, append([]interface{}(nil), options...))
@@ -251,9 +253,43 @@ func (r *fakeRepo) CreateStudentIfAccessCodeValid(_ context.Context, telegramID 
 		return nil, db.ErrStudentAlreadyRegistered
 	}
 	r.codes[code] = true
-	s := &db.Student{TelegramID: telegramID, Name: name, AccessCode: code, CreatedAt: time.Now()}
+	activatedAt := time.Now()
+	expiresAt := activatedAt.AddDate(0, 2, 0)
+	s := &db.Student{
+		TelegramID: telegramID, Name: name, AccessCode: code, CreatedAt: activatedAt,
+		AccessActivatedAt: activatedAt, AccessExpiresAt: expiresAt,
+	}
 	r.students[telegramID] = s
+	id := telegramID
+	r.tokenUsage[code] = &db.TokenUsageReport{
+		Code: code, IsUsed: true, StudentID: &id, StudentName: name,
+		ActivatedAt: &activatedAt, ExpiresAt: &expiresAt,
+	}
 	return s, nil
+}
+
+func (r *fakeRepo) RenewStudentAccessWithCode(_ context.Context, telegramID int64, code string) (*db.Student, error) {
+	r.maybePanic()
+	student, ok := r.students[telegramID]
+	if !ok {
+		return nil, db.ErrStudentNotFound
+	}
+	used, ok := r.codes[code]
+	if !ok || used {
+		return nil, db.ErrAccessCodeInvalid
+	}
+	activatedAt := time.Now()
+	expiresAt := activatedAt.AddDate(0, 2, 0)
+	r.codes[code] = true
+	student.AccessCode = code
+	student.AccessActivatedAt = activatedAt
+	student.AccessExpiresAt = expiresAt
+	id := telegramID
+	r.tokenUsage[code] = &db.TokenUsageReport{
+		Code: code, IsUsed: true, StudentID: &id, StudentName: student.Name,
+		ActivatedAt: &activatedAt, ExpiresAt: &expiresAt,
+	}
+	return student, nil
 }
 
 func (r *fakeRepo) GetStudentByTelegramID(_ context.Context, telegramID int64) (*db.Student, error) {
@@ -620,7 +656,10 @@ func (r *fakeRepo) GetStudentReports(_ context.Context) ([]db.StudentReport, err
 	r.maybePanic()
 	reports := make([]db.StudentReport, 0, len(r.students))
 	for id, s := range r.students {
-		rep := db.StudentReport{TelegramID: id, Name: s.Name, AccessCode: s.AccessCode}
+		rep := db.StudentReport{
+			TelegramID: id, Name: s.Name, AccessCode: s.AccessCode,
+			AccessActivatedAt: s.AccessActivatedAt, AccessExpiresAt: s.AccessExpiresAt,
+		}
 		var last *time.Time
 		for _, sess := range r.sessions {
 			if sess.StudentID != id {
@@ -1453,8 +1492,21 @@ func TestSplitTelegramText(t *testing.T) {
 // have to run a full registration + FSM flow per student.
 func seedStudentWithReport(repo *fakeRepo, telegramID int64, name string, completedSessions int, lastSessionAt time.Time, zones ...db.WeakZone) {
 	code := fmt.Sprintf("SA2026-R%03d", telegramID)
+	activatedAt := lastSessionAt
+	if activatedAt.IsZero() {
+		activatedAt = time.Now()
+	}
+	expiresAt := activatedAt.AddDate(0, 2, 0)
 	repo.codes[code] = true
-	repo.students[telegramID] = &db.Student{TelegramID: telegramID, Name: name, AccessCode: code, CreatedAt: lastSessionAt}
+	repo.students[telegramID] = &db.Student{
+		TelegramID: telegramID, Name: name, AccessCode: code, CreatedAt: activatedAt,
+		AccessActivatedAt: activatedAt, AccessExpiresAt: expiresAt,
+	}
+	id := telegramID
+	repo.tokenUsage[code] = &db.TokenUsageReport{
+		Code: code, IsUsed: true, StudentID: &id, StudentName: name,
+		ActivatedAt: &activatedAt, ExpiresAt: &expiresAt,
+	}
 	for i := 0; i < completedSessions; i++ {
 		repo.nextID++
 		repo.sessions[repo.nextID] = &db.Session{
@@ -1527,7 +1579,7 @@ func TestAdminCodeManagementAndTokenUsage(t *testing.T) {
 	if err := h.handleTokenUsage(usedTokens); err != nil {
 		t.Fatalf("get used-code tokens: %v", err)
 	}
-	for _, want := range []string{"Иван", "Вызовов модели: 1", "Входные токены: 100", "Всего токенов: 125", "Из них кэшировано: 80"} {
+	for _, want := range []string{"Статус: активен", "Активирован:", "Доступ до:", "Иван", "Вызовов модели: 1", "Входные токены: 100", "Всего токенов: 125", "Из них кэшировано: 80"} {
 		if len(usedTokens.sent) != 1 || !strings.Contains(usedTokens.sent[0], want) {
 			t.Fatalf("token report missing %q: %v", want, usedTokens.sent)
 		}
@@ -1537,10 +1589,16 @@ func TestAdminCodeManagementAndTokenUsage(t *testing.T) {
 	if err := h.handleListCodes(listCodes); err != nil {
 		t.Fatalf("list codes: %v", err)
 	}
-	for _, want := range []string{"SA2026-A001 — занят", "Иван, Telegram ID: 42", "Токены: 125", "SA2026-A002 — свободен"} {
+	for _, want := range []string{"SA2026-A001 — активен", "Иван, Telegram ID: 42", "Доступ до:", "Токены: 125", "SA2026-A002 — свободен"} {
 		if len(listCodes.sent) != 1 || !strings.Contains(listCodes.sent[0], want) {
 			t.Fatalf("code list missing %q: %v", want, listCodes.sent)
 		}
+	}
+	expiredAt := time.Now().Add(-time.Minute)
+	repo.tokenUsage["SA2026-A001"].ExpiresAt = &expiredAt
+	expiredCodes := newCtx(adminID, "/codes")
+	if err := h.handleListCodes(expiredCodes); err != nil || len(expiredCodes.sent) != 1 || !strings.Contains(expiredCodes.sent[0], "SA2026-A001 — истёк") {
+		t.Fatalf("expired code status is missing: sent=%v err=%v", expiredCodes.sent, err)
 	}
 
 	deleteUsed := newCtx(adminID, "/delete_code SA2026-A001", "SA2026-A001")
@@ -1626,7 +1684,7 @@ func TestReport_AdminLargeListSendsCSV(t *testing.T) {
 		t.Fatalf("expected %d rows (header + %d students), got %d", studentCount+1, studentCount, len(records))
 	}
 	wantHeader := []string{
-		"telegram_id", "name", "access_code", "completed_sessions", "last_session_at",
+		"telegram_id", "name", "access_code", "access_activated_at", "access_expires_at", "access_status", "completed_sessions", "last_session_at",
 		"llm_calls", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens",
 	}
 	if strings.Join(records[0], ",") != strings.Join(wantHeader, ",") {
@@ -1634,6 +1692,79 @@ func TestReport_AdminLargeListSendsCSV(t *testing.T) {
 	}
 	if records[1][2] == "" {
 		t.Fatalf("expected access code in CSV, got %v", records[1])
+	}
+	if records[1][4] == "" || records[1][5] == "" {
+		t.Fatalf("expected access expiry and status in CSV, got %v", records[1])
+	}
+}
+
+func TestExpiredAccessIsBlockedAndCanBeRenewedWithoutLosingSession(t *testing.T) {
+	repo := newFakeRepo("SA2026-OLD1", "SA2026-NEW1")
+	student, err := repo.CreateStudentIfAccessCodeValid(context.Background(), 42, "Иван", "SA2026-OLD1")
+	if err != nil {
+		t.Fatalf("register old code: %v", err)
+	}
+	student.AccessExpiresAt = time.Now().Add(-time.Minute)
+	if usage := repo.tokenUsage[student.AccessCode]; usage != nil {
+		expiredAt := student.AccessExpiresAt
+		usage.ExpiresAt = &expiredAt
+	}
+	session, err := repo.StartSession(context.Background(), student.TelegramID)
+	if err != nil {
+		t.Fatalf("start saved session: %v", err)
+	}
+	if err := repo.AdvancePhase(context.Background(), session.ID, db.SessionStatusQualification); err != nil {
+		t.Fatalf("advance saved session: %v", err)
+	}
+	if err := repo.SetQualificationAnswer(context.Background(), session.ID, db.QualificationStepCurrentGrade, "джун"); err != nil {
+		t.Fatalf("save current grade: %v", err)
+	}
+
+	h := New(repo, &fakeLLM{}, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, nil)
+	blocked := newCtx(student.TelegramID, "ответ")
+	blocked.callback = &tele.Callback{}
+	called := false
+	if err := h.requireActiveAccess(func(tele.Context) error { called = true; return nil })(blocked); err != nil {
+		t.Fatalf("access middleware: %v", err)
+	}
+	if called || !blocked.responded || len(blocked.sent) != 1 || blocked.sent[0] != accessExpiredMessage {
+		t.Fatalf("expired participant was not blocked: called=%v responded=%v sent=%v", called, blocked.responded, blocked.sent)
+	}
+
+	renew := newCtx(student.TelegramID, "/start SA2026-NEW1", "SA2026-NEW1")
+	if err := h.handleStart(renew); err != nil {
+		t.Fatalf("renew access: %v", err)
+	}
+	if len(renew.sent) != 2 || !strings.Contains(renew.sent[0], "Доступ продлён до") || renew.sent[1] != targetGradeQuestion {
+		t.Fatalf("renewal did not resume the saved qualification step: %v", renew.sent)
+	}
+	if student.AccessCode != "SA2026-NEW1" || !student.AccessExpiresAt.After(time.Now().AddDate(0, 1, 29)) {
+		t.Fatalf("unexpected renewed access: %+v", student)
+	}
+	gotSession, err := repo.GetActiveSession(context.Background(), student.TelegramID)
+	if err != nil || gotSession.ID != session.ID || gotSession.EndedAt != nil {
+		t.Fatalf("saved session was replaced during renewal: session=%+v err=%v", gotSession, err)
+	}
+}
+
+func TestAccessExpiryBoundaryAndAdminBypass(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	student := &db.Student{AccessExpiresAt: now}
+	if !isAccessExpired(student, now) || isAccessExpired(student, now.Add(-time.Nanosecond)) {
+		t.Fatal("access must expire exactly at the stored timestamp")
+	}
+
+	repo := newFakeRepo()
+	repo.students[99] = student
+	student.TelegramID = 99
+	h := New(repo, &fakeLLM{}, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, []int64{99})
+	called := false
+	ctx := newCtx(99, "/admin")
+	if err := h.requireActiveAccess(func(tele.Context) error { called = true; return nil })(ctx); err != nil {
+		t.Fatalf("admin bypass: %v", err)
+	}
+	if !called || len(ctx.sent) != 0 {
+		t.Fatalf("expired admin must retain admin access: called=%v sent=%v", called, ctx.sent)
 	}
 }
 
@@ -1948,13 +2079,14 @@ func TestFormatFollowupQuestionCapitalizesAndBoldsOnlyQuestion(t *testing.T) {
 }
 
 func TestCandidateFacingCopyUsesAccurateCountAndFormalAddress(t *testing.T) {
-	for _, want := range []string{"174 вопроса", "58 основных", "116 уточняющих"} {
-		if !strings.Contains(instructionMessage, want) {
-			t.Errorf("instruction is missing %q: %q", want, instructionMessage)
-		}
+	if !strings.Contains(instructionMessage, "собраны 174 вопроса") {
+		t.Errorf("instruction is missing the total question count: %q", instructionMessage)
 	}
 	if strings.Contains(instructionMessage, "собраны 58 вопросов") {
 		t.Fatal("instruction still presents only the number of primary questions")
+	}
+	if strings.Contains(instructionMessage, "58 основных") || strings.Contains(instructionMessage, "116 уточняющих") {
+		t.Fatal("instruction exposes the internal primary/follow-up breakdown")
 	}
 
 	question := &db.QuestionBank{QuestionText: "Что такое API?"}

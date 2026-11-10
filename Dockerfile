@@ -21,9 +21,9 @@ RUN apk add --no-cache ca-certificates \
     && addgroup -S app && adduser -S app -G app
 
 COPY --from=build /out/bot /usr/local/bin/bot
-COPY prompts /app/prompts
-COPY media /app/media
-COPY materials/question_bank.csv /app/materials/question_bank.csv
+COPY --chown=app:app prompts /app/prompts
+COPY --chown=app:app media /app/media
+COPY --chown=app:app materials/question_bank.csv /app/materials/question_bank.csv
 
 WORKDIR /app
 USER app

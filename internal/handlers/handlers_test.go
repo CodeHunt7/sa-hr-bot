@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/csv"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -102,13 +101,12 @@ type fakeRepo struct {
 	students      map[int64]*db.Student
 	sessions      map[int64]*db.Session
 	nextID        int64
-	codes         map[string]bool // code -> used
 	summaries     []db.SessionSummary
 	weakZones     map[int64][]db.WeakZone
 	questions     map[int64]*db.QuestionBank
 	attempts      map[int64]*db.QuestionAttempt
 	nextAttemptID int64
-	tokenUsage    map[string]*db.TokenUsageReport
+	tokenUsage    map[int64]*db.StudentReport
 
 	// panicOnAnyCall makes every method below panic immediately, for
 	// tests proving recoverMiddleware actually wraps a given endpoint:
@@ -124,66 +122,23 @@ func (r *fakeRepo) maybePanic() {
 	}
 }
 
-func newFakeRepo(codes ...string) *fakeRepo {
-	m := make(map[string]bool, len(codes))
-	for _, c := range codes {
-		m[c] = false
-	}
+func newFakeRepo() *fakeRepo {
 	return &fakeRepo{
 		students:   make(map[int64]*db.Student),
 		sessions:   make(map[int64]*db.Session),
-		codes:      m,
 		weakZones:  make(map[int64][]db.WeakZone),
 		questions:  make(map[int64]*db.QuestionBank),
 		attempts:   make(map[int64]*db.QuestionAttempt),
-		tokenUsage: make(map[string]*db.TokenUsageReport),
+		tokenUsage: make(map[int64]*db.StudentReport),
 	}
-}
-
-func (r *fakeRepo) CreateAccessCodes(_ context.Context, count int) ([]string, error) {
-	r.maybePanic()
-	if count < 1 || count > 100 {
-		return nil, errors.New("invalid count")
-	}
-	result := make([]string, 0, count)
-	for len(result) < count {
-		code := fmt.Sprintf("SA2026-A%03d", len(r.codes)+1)
-		if _, exists := r.codes[code]; exists {
-			continue
-		}
-		r.codes[code] = false
-		result = append(result, code)
-	}
-	return result, nil
-}
-
-func (r *fakeRepo) DeleteUnusedAccessCode(_ context.Context, code string) error {
-	r.maybePanic()
-	used, ok := r.codes[code]
-	if !ok {
-		return db.ErrAccessCodeNotFound
-	}
-	if used {
-		return db.ErrAccessCodeInUse
-	}
-	delete(r.codes, code)
-	return nil
 }
 
 func (r *fakeRepo) SaveLLMUsage(_ context.Context, studentID, _ int64, _ string, promptTokens, completionTokens, totalTokens, cachedTokens int64) error {
 	r.maybePanic()
-	student, ok := r.students[studentID]
-	if !ok {
-		// Some focused handler tests pass an already loaded student directly
-		// without seeding registration state. The real DB always has the FK;
-		// those tests only need usage persistence not to obscure their subject.
-		return nil
-	}
-	report := r.tokenUsage[student.AccessCode]
+	report := r.tokenUsage[studentID]
 	if report == nil {
-		id := student.TelegramID
-		report = &db.TokenUsageReport{Code: student.AccessCode, IsUsed: true, StudentID: &id, StudentName: student.Name}
-		r.tokenUsage[student.AccessCode] = report
+		report = &db.StudentReport{}
+		r.tokenUsage[studentID] = report
 	}
 	report.Calls++
 	report.PromptTokens += promptTokens
@@ -191,47 +146,6 @@ func (r *fakeRepo) SaveLLMUsage(_ context.Context, studentID, _ int64, _ string,
 	report.TotalTokens += totalTokens
 	report.CachedTokens += cachedTokens
 	return nil
-}
-
-func (r *fakeRepo) GetTokenUsageByAccessCode(_ context.Context, code string) (*db.TokenUsageReport, error) {
-	r.maybePanic()
-	used, ok := r.codes[code]
-	if !ok {
-		return nil, db.ErrAccessCodeNotFound
-	}
-	if report := r.tokenUsage[code]; report != nil {
-		cp := *report
-		return &cp, nil
-	}
-	return &db.TokenUsageReport{Code: code, IsUsed: used}, nil
-}
-
-func (r *fakeRepo) ListAccessCodes(_ context.Context) ([]db.TokenUsageReport, error) {
-	r.maybePanic()
-	reports := make([]db.TokenUsageReport, 0, len(r.codes))
-	for code, used := range r.codes {
-		report := db.TokenUsageReport{Code: code, IsUsed: used}
-		if saved := r.tokenUsage[code]; saved != nil {
-			report = *saved
-		} else if used {
-			for _, student := range r.students {
-				if student.AccessCode == code {
-					id := student.TelegramID
-					report.StudentID = &id
-					report.StudentName = student.Name
-					break
-				}
-			}
-		}
-		reports = append(reports, report)
-	}
-	sort.Slice(reports, func(i, j int) bool {
-		if reports[i].IsUsed != reports[j].IsUsed {
-			return !reports[i].IsUsed
-		}
-		return reports[i].Code < reports[j].Code
-	})
-	return reports, nil
 }
 
 func (r *fakeRepo) sessionByID(id int64) (*db.Session, error) {
@@ -243,53 +157,12 @@ func (r *fakeRepo) sessionByID(id int64) (*db.Session, error) {
 	return &cp, nil
 }
 
-func (r *fakeRepo) CreateStudentIfAccessCodeValid(_ context.Context, telegramID int64, name, code string) (*db.Student, error) {
+func (r *fakeRepo) RegisterStudent(_ context.Context, telegramID int64, name string) error {
 	r.maybePanic()
-	used, ok := r.codes[code]
-	if !ok || used {
-		return nil, db.ErrAccessCodeInvalid
+	if _, exists := r.students[telegramID]; !exists {
+		r.students[telegramID] = &db.Student{TelegramID: telegramID, Name: name, CreatedAt: time.Now()}
 	}
-	if _, exists := r.students[telegramID]; exists {
-		return nil, db.ErrStudentAlreadyRegistered
-	}
-	r.codes[code] = true
-	activatedAt := time.Now()
-	expiresAt := activatedAt.AddDate(0, 2, 0)
-	s := &db.Student{
-		TelegramID: telegramID, Name: name, AccessCode: code, CreatedAt: activatedAt,
-		AccessActivatedAt: activatedAt, AccessExpiresAt: expiresAt,
-	}
-	r.students[telegramID] = s
-	id := telegramID
-	r.tokenUsage[code] = &db.TokenUsageReport{
-		Code: code, IsUsed: true, StudentID: &id, StudentName: name,
-		ActivatedAt: &activatedAt, ExpiresAt: &expiresAt,
-	}
-	return s, nil
-}
-
-func (r *fakeRepo) RenewStudentAccessWithCode(_ context.Context, telegramID int64, code string) (*db.Student, error) {
-	r.maybePanic()
-	student, ok := r.students[telegramID]
-	if !ok {
-		return nil, db.ErrStudentNotFound
-	}
-	used, ok := r.codes[code]
-	if !ok || used {
-		return nil, db.ErrAccessCodeInvalid
-	}
-	activatedAt := time.Now()
-	expiresAt := activatedAt.AddDate(0, 2, 0)
-	r.codes[code] = true
-	student.AccessCode = code
-	student.AccessActivatedAt = activatedAt
-	student.AccessExpiresAt = expiresAt
-	id := telegramID
-	r.tokenUsage[code] = &db.TokenUsageReport{
-		Code: code, IsUsed: true, StudentID: &id, StudentName: student.Name,
-		ActivatedAt: &activatedAt, ExpiresAt: &expiresAt,
-	}
-	return student, nil
+	return nil
 }
 
 func (r *fakeRepo) GetStudentByTelegramID(_ context.Context, telegramID int64) (*db.Student, error) {
@@ -656,10 +529,7 @@ func (r *fakeRepo) GetStudentReports(_ context.Context) ([]db.StudentReport, err
 	r.maybePanic()
 	reports := make([]db.StudentReport, 0, len(r.students))
 	for id, s := range r.students {
-		rep := db.StudentReport{
-			TelegramID: id, Name: s.Name, AccessCode: s.AccessCode,
-			AccessActivatedAt: s.AccessActivatedAt, AccessExpiresAt: s.AccessExpiresAt,
-		}
+		rep := db.StudentReport{TelegramID: id, Name: s.Name}
 		var last *time.Time
 		for _, sess := range r.sessions {
 			if sess.StudentID != id {
@@ -674,7 +544,7 @@ func (r *fakeRepo) GetStudentReports(_ context.Context) ([]db.StudentReport, err
 			}
 		}
 		rep.LastSessionAt = last
-		if usage := r.tokenUsage[s.AccessCode]; usage != nil {
+		if usage := r.tokenUsage[id]; usage != nil {
 			rep.Calls = usage.Calls
 			rep.PromptTokens = usage.PromptTokens
 			rep.CompletionTokens = usage.CompletionTokens
@@ -685,6 +555,23 @@ func (r *fakeRepo) GetStudentReports(_ context.Context) ([]db.StudentReport, err
 	}
 	sort.Slice(reports, func(i, j int) bool { return reports[i].TelegramID < reports[j].TelegramID })
 	return reports, nil
+}
+
+func (r *fakeRepo) GetStudentReport(ctx context.Context, telegramID int64) (*db.StudentReport, error) {
+	reports, err := r.GetStudentReports(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, report := range reports {
+		if report.TelegramID == telegramID {
+			return &report, nil
+		}
+	}
+	return nil, db.ErrStudentNotFound
+}
+
+func subscribedMember(_, _ tele.Recipient) (*tele.ChatMember, error) {
+	return &tele.ChatMember{Role: tele.Member}, nil
 }
 
 // fakeLLM is an in-memory stand-in for *llm.Service.
@@ -721,7 +608,7 @@ func (f *fakeLLM) Reply(_ context.Context, userMessage string) (*llm.Reply, erro
 
 func TestRunSummaryReusesSavedReportAfterSendFailure(t *testing.T) {
 	repo := newFakeRepo()
-	student := &db.Student{TelegramID: 77, Name: "Тест", AccessCode: "SA2026-TEST"}
+	student := &db.Student{TelegramID: 77, Name: "Тест"}
 	repo.students[student.TelegramID] = student
 	session := &db.Session{
 		ID: 1, StudentID: student.TelegramID, Status: db.SessionStatusSummary,
@@ -741,7 +628,7 @@ func TestRunSummaryReusesSavedReportAfterSendFailure(t *testing.T) {
 	if lm.replyCalls != 0 {
 		t.Fatalf("saved summary should avoid another LLM call, got %d calls", lm.replyCalls)
 	}
-	if len(ctx.sent) != 1 || !strings.Contains(ctx.sent[0], "Уже сохраненный итог") || !strings.Contains(ctx.sent[0], "/start SA2026-TEST") {
+	if len(ctx.sent) != 1 || !strings.Contains(ctx.sent[0], "Уже сохраненный итог") || !strings.Contains(ctx.sent[0], "/start") {
 		t.Fatalf("unexpected sent messages: %v", ctx.sent)
 	}
 	if repo.sessions[session.ID].Status != db.SessionStatusSummary || repo.sessions[session.ID].EndedAt != nil {
@@ -782,8 +669,29 @@ func (f *fakeLLM) PickQuestionForSession(ctx context.Context, _ int64, grade, to
 	return f.PickQuestion(ctx, grade, topic)
 }
 
+func assertSubscriptionButtons(t *testing.T, ctx *fakeContext, checkLabel string) {
+	t.Helper()
+	if len(ctx.sentOptions) != 1 {
+		t.Fatalf("expected one keyboard, got %v", ctx.sentOptions)
+	}
+	for _, option := range ctx.sentOptions[0] {
+		if menu, ok := option.(*tele.ReplyMarkup); ok {
+			rows := menu.InlineKeyboard
+			if len(rows) != 2 || len(rows[0]) != 1 || len(rows[1]) != 1 {
+				t.Fatalf("expected two buttons, got %v", rows)
+			}
+			if rows[0][0].Text != "Подписаться на канал" || rows[0][0].URL != "https://t.me/sa_jelatinka" ||
+				rows[1][0].Text != checkLabel || rows[1][0].CallbackUnique() != btnCheckSubscription.CallbackUnique() {
+				t.Fatalf("unexpected subscription keyboard: %v", rows)
+			}
+			return
+		}
+	}
+	t.Fatal("missing subscription keyboard")
+}
+
 func TestFullSessionFlow(t *testing.T) {
-	repo := newFakeRepo("SA2026-TEST")
+	repo := newFakeRepo()
 	question := &db.QuestionBank{
 		ID: 1, QuestionText: "q", Grade: "мидл", Topic: "бд",
 		Followup1: "follow-up q", Followup2: "follow-up q2",
@@ -797,30 +705,57 @@ func TestFullSessionFlow(t *testing.T) {
 	const telegramID = 42
 	ctx := context.Background()
 
-	// Invalid code: no student created, no session started.
-	badCtx := newCtx(telegramID, "/start WRONG", "WRONG")
-	if err := h.handleStart(badCtx); err != nil {
-		t.Fatalf("handleStart (bad code): %v", err)
-	}
-	if len(badCtx.sent) != 1 || !strings.Contains(badCtx.sent[0], "Код не подходит") {
-		t.Fatalf("expected invalid code message, got %v", badCtx.sent)
-	}
-	if _, err := repo.GetStudentByTelegramID(ctx, telegramID); !errors.Is(err, db.ErrStudentNotFound) {
-		t.Fatalf("student should not exist after an invalid code")
-	}
-
-	// Valid code: registers, sends the welcome photo, fixed instruction and
-	// current-grade question, then lands in deterministic QUALIFICATION without
-	// calling the model.
-	startCtx := newCtx(telegramID, "/start SA2026-TEST", "SA2026-TEST")
+	startCtx := newCtx(telegramID, "/start")
 	if err := h.handleStart(startCtx); err != nil {
 		t.Fatalf("handleStart: %v", err)
 	}
-	if len(startCtx.sentPhotos) != 1 || startCtx.sentPhotos[0].FileLocal != welcomePhotoPath {
-		t.Fatalf("expected welcome photo, got %+v", startCtx.sentPhotos)
+	if len(startCtx.sentPhotos) != 1 || startCtx.sentPhotos[0].FileLocal != welcomePhotoPath ||
+		startCtx.sentPhotos[0].Caption != welcomeMessage || len(startCtx.sent) != 0 {
+		t.Fatalf("expected welcome as a photo caption, got photos=%+v text=%v", startCtx.sentPhotos, startCtx.sent)
 	}
-	if len(startCtx.sent) != 2 || startCtx.sent[0] != instructionMessage || startCtx.sent[1] != currentGradeQuestion {
-		t.Fatalf("unexpected initial messages: %v", startCtx.sent)
+	assertSubscriptionButtons(t, startCtx, "Я готов")
+
+	for range 2 {
+		retry := newCtx(telegramID, "")
+		err := h.handleSubscription(retry, func(channel, user tele.Recipient) (*tele.ChatMember, error) {
+			if channel.Recipient() != "@sa_jelatinka" || user.Recipient() != "42" {
+				t.Fatalf("unexpected membership lookup: channel=%q user=%q", channel.Recipient(), user.Recipient())
+			}
+			return &tele.ChatMember{Role: tele.Left}, nil
+		})
+		if err != nil || len(retry.sent) != 1 || retry.sent[0] != subscriptionRequiredMessage {
+			t.Fatalf("expected a subscription prompt, got %v, error %v", retry.sent, err)
+		}
+		assertSubscriptionButtons(t, retry, "Я в деле")
+	}
+
+	failed := newCtx(telegramID, "")
+	err := h.handleSubscription(failed, func(_, _ tele.Recipient) (*tele.ChatMember, error) {
+		return nil, errors.New("Telegram unavailable")
+	})
+	if err != nil || len(failed.sent) != 1 || failed.sent[0] != subscriptionErrorMessage {
+		t.Fatalf("expected a retry after Telegram failure, got %v, error %v", failed.sent, err)
+	}
+	assertSubscriptionButtons(t, failed, "Я в деле")
+
+	if len(repo.students) != 0 || len(repo.sessions) != 0 {
+		t.Fatal("the subscription check must succeed before creating a profile or session")
+	}
+
+	ready := newCtx(telegramID, "")
+	if err := h.handleSubscription(ready, subscribedMember); err != nil {
+		t.Fatalf("handleSubscription: %v", err)
+	}
+	if len(ready.sent) != 2 || ready.sent[0] != instructionMessage || ready.sent[1] != currentGradeQuestion {
+		t.Fatalf("unexpected messages after checking the subscription: %v", ready.sent)
+	}
+	if lm.replyCalls != 0 || lm.pickCalls != 0 {
+		t.Fatal("onboarding must not use the model")
+	}
+
+	stale := newCtx(telegramID, "")
+	if err := h.handleSubscription(stale, subscribedMember); err != nil || len(stale.sent) != 0 || len(repo.sessions) != 1 {
+		t.Fatalf("repeated callback must leave the session alone: sent=%v sessions=%d error=%v", stale.sent, len(repo.sessions), err)
 	}
 	session, err := repo.GetActiveSession(ctx, telegramID)
 	if err != nil {
@@ -1076,7 +1011,7 @@ func TestFullSessionFlow(t *testing.T) {
 		t.Fatalf("finish callback: %v", err)
 	}
 	if len(finishCtx.sent) != 1 || !strings.Contains(finishCtx.sent[0], "Итоговый отчет") ||
-		!strings.Contains(finishCtx.sent[0], "/start SA2026-TEST") {
+		!strings.Contains(finishCtx.sent[0], "/start") {
 		t.Fatalf("expected final summary, got %v", finishCtx.sent)
 	}
 	if len(finishCtx.sentOptions) != 1 || len(finishCtx.sentOptions[0]) != 1 || finishCtx.sentOptions[0][0] != summaryMenu {
@@ -1090,9 +1025,9 @@ func TestFullSessionFlow(t *testing.T) {
 	if len(repo.summaries) != 1 || repo.summaries[0].SummaryText != "Итоговый отчет" {
 		t.Fatalf("expected the summary to be saved, got %v", repo.summaries)
 	}
-	usage, err := repo.GetTokenUsageByAccessCode(ctx, "SA2026-TEST")
+	usage, err := repo.GetStudentReport(ctx, telegramID)
 	if err != nil || usage.Calls != 7 || usage.PromptTokens != 70 || usage.CompletionTokens != 35 || usage.TotalTokens != 105 || usage.CachedTokens != 21 {
-		t.Fatalf("expected every LLM call to be attributed to the access code, usage=%+v err=%v", usage, err)
+		t.Fatalf("expected every LLM call to be attributed to the Telegram ID, usage=%+v err=%v", usage, err)
 	}
 
 	returnCtx := newCtx(telegramID, "")
@@ -1133,7 +1068,7 @@ func TestTargetGradeMenuContainsOnlyMiddleAndSenior(t *testing.T) {
 
 func TestLegacyJuniorTargetCanBeReplacedWithoutLosingSession(t *testing.T) {
 	repo := newFakeRepo()
-	student := &db.Student{TelegramID: 77, Name: "Тест", AccessCode: "SA2026-LEGACY"}
+	student := &db.Student{TelegramID: 77, Name: "Тест"}
 	session := &db.Session{
 		ID: 1, StudentID: student.TelegramID, Status: db.SessionStatusQuestionCycle,
 		CurrentGrade: "джун", Grade: "джун", StrongZones: "требования", WeakZonesInput: "бд",
@@ -1182,7 +1117,7 @@ func TestSendKDIRVideoUsesConfiguredTelegramFileID(t *testing.T) {
 }
 
 func TestRestartDuringActiveSession(t *testing.T) {
-	repo := newFakeRepo("SA2026-TEST")
+	repo := newFakeRepo()
 	lm := &fakeLLM{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := New(repo, lm, logger, 8, nil)
@@ -1191,7 +1126,7 @@ func TestRestartDuringActiveSession(t *testing.T) {
 	ctx := context.Background()
 
 	lm.replies = []string{"инструкция"}
-	if err := h.handleStart(newCtx(telegramID, "/start SA2026-TEST", "SA2026-TEST")); err != nil {
+	if err := h.handleSubscription(newCtx(telegramID, ""), subscribedMember); err != nil {
 		t.Fatalf("initial start: %v", err)
 	}
 
@@ -1237,38 +1172,8 @@ func TestRestartDuringActiveSession(t *testing.T) {
 	}
 }
 
-func TestStartWithOriginalCodeImmediatelyStartsOver(t *testing.T) {
-	repo := newFakeRepo("SA2026-TEST")
-	h := New(repo, &fakeLLM{}, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, nil)
-	const telegramID = 8
-
-	if err := h.handleStart(newCtx(telegramID, "/start SA2026-TEST", "SA2026-TEST")); err != nil {
-		t.Fatalf("initial start: %v", err)
-	}
-	oldSession, err := repo.GetActiveSession(context.Background(), telegramID)
-	if err != nil {
-		t.Fatalf("get initial session: %v", err)
-	}
-
-	restart := newCtx(telegramID, "/start SA2026-TEST", "SA2026-TEST")
-	if err := h.handleStart(restart); err != nil {
-		t.Fatalf("restart by original code: %v", err)
-	}
-	if len(restart.sent) != 2 || restart.sent[0] != instructionMessage || restart.sent[1] != currentGradeQuestion {
-		t.Fatalf("expected immediate fresh qualification, got %v", restart.sent)
-	}
-	oldAfter, err := repo.sessionByID(oldSession.ID)
-	if err != nil || oldAfter.Status != db.SessionStatusAbandoned || oldAfter.EndedAt == nil {
-		t.Fatalf("old session must remain as abandoned history, session=%+v err=%v", oldAfter, err)
-	}
-	fresh, err := repo.GetActiveSession(context.Background(), telegramID)
-	if err != nil || fresh.ID == oldSession.ID || fresh.Status != db.SessionStatusQualification {
-		t.Fatalf("expected fresh qualification session, session=%+v err=%v", fresh, err)
-	}
-}
-
 func TestContinueDuringActiveSession(t *testing.T) {
-	repo := newFakeRepo("SA2026-TEST")
+	repo := newFakeRepo()
 	lm := &fakeLLM{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := New(repo, lm, logger, 8, nil)
@@ -1277,7 +1182,7 @@ func TestContinueDuringActiveSession(t *testing.T) {
 	ctx := context.Background()
 
 	lm.replies = []string{"инструкция"}
-	if err := h.handleStart(newCtx(telegramID, "/start SA2026-TEST", "SA2026-TEST")); err != nil {
+	if err := h.handleSubscription(newCtx(telegramID, ""), subscribedMember); err != nil {
 		t.Fatalf("initial start: %v", err)
 	}
 	before, err := repo.GetActiveSession(ctx, telegramID)
@@ -1303,12 +1208,12 @@ func TestContinueDuringActiveSession(t *testing.T) {
 }
 
 func TestContinueCallback_NoActiveSession(t *testing.T) {
-	repo := newFakeRepo("SA2026-TEST")
+	repo := newFakeRepo()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := New(repo, &fakeLLM{}, logger, 8, nil)
 
 	const telegramID = 10
-	if _, err := repo.CreateStudentIfAccessCodeValid(context.Background(), telegramID, "Тест", "SA2026-TEST"); err != nil {
+	if err := repo.RegisterStudent(context.Background(), telegramID, "Тест"); err != nil {
 		t.Fatalf("seed student: %v", err)
 	}
 	// Deliberately no session started: this is the race handleContinueCallback's
@@ -1331,7 +1236,7 @@ func TestContinueCallback_NoActiveSession(t *testing.T) {
 // telegram_id 755067732 case from the earlier incident) and asserts the
 // new session is blank across all of them.
 func TestRestartCallback_ResetsAllSessionFields(t *testing.T) {
-	repo := newFakeRepo("SA2026-TEST")
+	repo := newFakeRepo()
 	lm := &fakeLLM{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := New(repo, lm, logger, 8, nil)
@@ -1340,7 +1245,7 @@ func TestRestartCallback_ResetsAllSessionFields(t *testing.T) {
 	ctx := context.Background()
 
 	lm.replies = []string{"инструкция"}
-	if err := h.handleStart(newCtx(telegramID, "/start SA2026-TEST", "SA2026-TEST")); err != nil {
+	if err := h.handleSubscription(newCtx(telegramID, ""), subscribedMember); err != nil {
 		t.Fatalf("initial start: %v", err)
 	}
 
@@ -1491,22 +1396,7 @@ func TestSplitTelegramText(t *testing.T) {
 // session and weak zones, directly into the fake so /report tests don't
 // have to run a full registration + FSM flow per student.
 func seedStudentWithReport(repo *fakeRepo, telegramID int64, name string, completedSessions int, lastSessionAt time.Time, zones ...db.WeakZone) {
-	code := fmt.Sprintf("SA2026-R%03d", telegramID)
-	activatedAt := lastSessionAt
-	if activatedAt.IsZero() {
-		activatedAt = time.Now()
-	}
-	expiresAt := activatedAt.AddDate(0, 2, 0)
-	repo.codes[code] = true
-	repo.students[telegramID] = &db.Student{
-		TelegramID: telegramID, Name: name, AccessCode: code, CreatedAt: activatedAt,
-		AccessActivatedAt: activatedAt, AccessExpiresAt: expiresAt,
-	}
-	id := telegramID
-	repo.tokenUsage[code] = &db.TokenUsageReport{
-		Code: code, IsUsed: true, StudentID: &id, StudentName: name,
-		ActivatedAt: &activatedAt, ExpiresAt: &expiresAt,
-	}
+	repo.students[telegramID] = &db.Student{TelegramID: telegramID, Name: name}
 	for i := 0; i < completedSessions; i++ {
 		repo.nextID++
 		repo.sessions[repo.nextID] = &db.Session{
@@ -1535,79 +1425,37 @@ func TestReport_NonAdminSilentlyIgnored(t *testing.T) {
 	}
 }
 
-func TestAdminCodeManagementAndTokenUsage(t *testing.T) {
+func TestAdminTokenUsageByTelegramID(t *testing.T) {
 	repo := newFakeRepo()
 	const adminID = int64(999)
 	h := New(repo, &fakeLLM{}, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, []int64{adminID})
 
-	nonAdmin := newCtx(123, "/code 2", "2")
-	if err := h.handleCreateCodes(nonAdmin); err != nil || len(nonAdmin.sent) != 0 {
+	nonAdmin := newCtx(123, "/tokens 42", "42")
+	if err := h.handleTokenUsage(nonAdmin); err != nil || len(nonAdmin.sent) != 0 {
 		t.Fatalf("non-admin command must be silent, sent=%v err=%v", nonAdmin.sent, err)
 	}
-
 	help := newCtx(adminID, "/admin")
-	if err := h.handleAdminHelp(help); err != nil || len(help.sent) != 1 || !strings.Contains(help.sent[0], "/delete_code") {
+	if err := h.handleAdminHelp(help); err != nil || len(help.sent) != 1 ||
+		!strings.Contains(help.sent[0], "/tokens TELEGRAM_ID") || strings.Contains(help.sent[0], "/code") {
 		t.Fatalf("unexpected admin help: sent=%v err=%v", help.sent, err)
 	}
 
-	create := newCtx(adminID, "/code 2", "2")
-	if err := h.handleCreateCodes(create); err != nil {
-		t.Fatalf("create codes: %v", err)
+	ctx := context.Background()
+	if err := repo.RegisterStudent(ctx, 42, "Иван"); err != nil {
+		t.Fatalf("register student: %v", err)
 	}
-	if len(create.sent) != 1 || !strings.Contains(create.sent[0], "SA2026-A001") || !strings.Contains(create.sent[0], "SA2026-A002") {
-		t.Fatalf("unexpected generated codes: %v", create.sent)
-	}
-
-	unusedTokens := newCtx(adminID, "/tokens SA2026-A001", "SA2026-A001")
-	if err := h.handleTokenUsage(unusedTokens); err != nil || len(unusedTokens.sent) != 1 || !strings.Contains(unusedTokens.sent[0], "не использован") {
-		t.Fatalf("unexpected unused-code usage: sent=%v err=%v", unusedTokens.sent, err)
-	}
-
-	student, err := repo.CreateStudentIfAccessCodeValid(context.Background(), 42, "Иван", "SA2026-A001")
-	if err != nil {
-		t.Fatalf("register generated code: %v", err)
-	}
-	session, err := repo.StartSession(context.Background(), student.TelegramID)
-	if err != nil {
-		t.Fatalf("start session: %v", err)
-	}
-	if err := repo.SaveLLMUsage(context.Background(), student.TelegramID, session.ID, llmOperationPrimaryFeedback, 100, 25, 125, 80); err != nil {
+	if err := repo.SaveLLMUsage(ctx, 42, 1, llmOperationPrimaryFeedback, 100, 25, 125, 80); err != nil {
 		t.Fatalf("save usage: %v", err)
 	}
 
-	usedTokens := newCtx(adminID, "/tokens SA2026-A001", "SA2026-A001")
-	if err := h.handleTokenUsage(usedTokens); err != nil {
-		t.Fatalf("get used-code tokens: %v", err)
+	usage := newCtx(adminID, "/tokens 42", "42")
+	if err := h.handleTokenUsage(usage); err != nil {
+		t.Fatalf("get tokens: %v", err)
 	}
-	for _, want := range []string{"Статус: активен", "Активирован:", "Доступ до:", "Иван", "Вызовов модели: 1", "Входные токены: 100", "Всего токенов: 125", "Из них кэшировано: 80"} {
-		if len(usedTokens.sent) != 1 || !strings.Contains(usedTokens.sent[0], want) {
-			t.Fatalf("token report missing %q: %v", want, usedTokens.sent)
+	for _, want := range []string{"Иван", "Вызовов модели: 1", "Входные токены: 100", "Всего токенов: 125", "Из них кэшировано: 80"} {
+		if len(usage.sent) != 1 || !strings.Contains(usage.sent[0], want) {
+			t.Fatalf("token report missing %q: %v", want, usage.sent)
 		}
-	}
-
-	listCodes := newCtx(adminID, "/codes")
-	if err := h.handleListCodes(listCodes); err != nil {
-		t.Fatalf("list codes: %v", err)
-	}
-	for _, want := range []string{"SA2026-A001 — активен", "Иван, Telegram ID: 42", "Доступ до:", "Токены: 125", "SA2026-A002 — свободен"} {
-		if len(listCodes.sent) != 1 || !strings.Contains(listCodes.sent[0], want) {
-			t.Fatalf("code list missing %q: %v", want, listCodes.sent)
-		}
-	}
-	expiredAt := time.Now().Add(-time.Minute)
-	repo.tokenUsage["SA2026-A001"].ExpiresAt = &expiredAt
-	expiredCodes := newCtx(adminID, "/codes")
-	if err := h.handleListCodes(expiredCodes); err != nil || len(expiredCodes.sent) != 1 || !strings.Contains(expiredCodes.sent[0], "SA2026-A001 — истёк") {
-		t.Fatalf("expired code status is missing: sent=%v err=%v", expiredCodes.sent, err)
-	}
-
-	deleteUsed := newCtx(adminID, "/delete_code SA2026-A001", "SA2026-A001")
-	if err := h.handleDeleteCode(deleteUsed); err != nil || len(deleteUsed.sent) != 1 || !strings.Contains(deleteUsed.sent[0], "Удаление запрещено") {
-		t.Fatalf("used code must be protected: sent=%v err=%v", deleteUsed.sent, err)
-	}
-	deleteUnused := newCtx(adminID, "/delete_code SA2026-A002", "SA2026-A002")
-	if err := h.handleDeleteCode(deleteUnused); err != nil || len(deleteUnused.sent) != 1 || !strings.Contains(deleteUnused.sent[0], "удалён") {
-		t.Fatalf("unused code deletion failed: sent=%v err=%v", deleteUnused.sent, err)
 	}
 }
 
@@ -1638,7 +1486,7 @@ func TestReport_AdminSmallListSendsText(t *testing.T) {
 	text := ctx.sent[0]
 	for _, want := range []string{
 		"telegram_id: 1", "Иван Иванов", "Завершенных сессий: 2",
-		"Код: SA2026-R001", "Токены: 0",
+		"Зарегистрировано пользователей: 2", "Всего токенов: 0", "Токены: 0",
 		"telegram_id: 2", "Мария Петрова", "Завершенных сессий: 0",
 	} {
 		if !strings.Contains(text, want) {
@@ -1684,92 +1532,19 @@ func TestReport_AdminLargeListSendsCSV(t *testing.T) {
 		t.Fatalf("expected %d rows (header + %d students), got %d", studentCount+1, studentCount, len(records))
 	}
 	wantHeader := []string{
-		"telegram_id", "name", "access_code", "access_activated_at", "access_expires_at", "access_status", "completed_sessions", "last_session_at",
+		"telegram_id", "name", "completed_sessions", "last_session_at",
 		"llm_calls", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens",
 	}
 	if strings.Join(records[0], ",") != strings.Join(wantHeader, ",") {
 		t.Fatalf("unexpected csv header: %v", records[0])
 	}
-	if records[1][2] == "" {
-		t.Fatalf("expected access code in CSV, got %v", records[1])
-	}
-	if records[1][4] == "" || records[1][5] == "" {
-		t.Fatalf("expected access expiry and status in CSV, got %v", records[1])
-	}
-}
-
-func TestExpiredAccessIsBlockedAndCanBeRenewedWithoutLosingSession(t *testing.T) {
-	repo := newFakeRepo("SA2026-OLD1", "SA2026-NEW1")
-	student, err := repo.CreateStudentIfAccessCodeValid(context.Background(), 42, "Иван", "SA2026-OLD1")
-	if err != nil {
-		t.Fatalf("register old code: %v", err)
-	}
-	student.AccessExpiresAt = time.Now().Add(-time.Minute)
-	if usage := repo.tokenUsage[student.AccessCode]; usage != nil {
-		expiredAt := student.AccessExpiresAt
-		usage.ExpiresAt = &expiredAt
-	}
-	session, err := repo.StartSession(context.Background(), student.TelegramID)
-	if err != nil {
-		t.Fatalf("start saved session: %v", err)
-	}
-	if err := repo.AdvancePhase(context.Background(), session.ID, db.SessionStatusQualification); err != nil {
-		t.Fatalf("advance saved session: %v", err)
-	}
-	if err := repo.SetQualificationAnswer(context.Background(), session.ID, db.QualificationStepCurrentGrade, "джун"); err != nil {
-		t.Fatalf("save current grade: %v", err)
-	}
-
-	h := New(repo, &fakeLLM{}, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, nil)
-	blocked := newCtx(student.TelegramID, "ответ")
-	blocked.callback = &tele.Callback{}
-	called := false
-	if err := h.requireActiveAccess(func(tele.Context) error { called = true; return nil })(blocked); err != nil {
-		t.Fatalf("access middleware: %v", err)
-	}
-	if called || !blocked.responded || len(blocked.sent) != 1 || blocked.sent[0] != accessExpiredMessage {
-		t.Fatalf("expired participant was not blocked: called=%v responded=%v sent=%v", called, blocked.responded, blocked.sent)
-	}
-
-	renew := newCtx(student.TelegramID, "/start SA2026-NEW1", "SA2026-NEW1")
-	if err := h.handleStart(renew); err != nil {
-		t.Fatalf("renew access: %v", err)
-	}
-	if len(renew.sent) != 2 || !strings.Contains(renew.sent[0], "Доступ продлён до") || renew.sent[1] != targetGradeQuestion {
-		t.Fatalf("renewal did not resume the saved qualification step: %v", renew.sent)
-	}
-	if student.AccessCode != "SA2026-NEW1" || !student.AccessExpiresAt.After(time.Now().AddDate(0, 1, 29)) {
-		t.Fatalf("unexpected renewed access: %+v", student)
-	}
-	gotSession, err := repo.GetActiveSession(context.Background(), student.TelegramID)
-	if err != nil || gotSession.ID != session.ID || gotSession.EndedAt != nil {
-		t.Fatalf("saved session was replaced during renewal: session=%+v err=%v", gotSession, err)
-	}
-}
-
-func TestAccessExpiryBoundaryAndAdminBypass(t *testing.T) {
-	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
-	student := &db.Student{AccessExpiresAt: now}
-	if !isAccessExpired(student, now) || isAccessExpired(student, now.Add(-time.Nanosecond)) {
-		t.Fatal("access must expire exactly at the stored timestamp")
-	}
-
-	repo := newFakeRepo()
-	repo.students[99] = student
-	student.TelegramID = 99
-	h := New(repo, &fakeLLM{}, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, []int64{99})
-	called := false
-	ctx := newCtx(99, "/admin")
-	if err := h.requireActiveAccess(func(tele.Context) error { called = true; return nil })(ctx); err != nil {
-		t.Fatalf("admin bypass: %v", err)
-	}
-	if !called || len(ctx.sent) != 0 {
-		t.Fatalf("expired admin must retain admin access: called=%v sent=%v", called, ctx.sent)
+	if !strings.Contains(ctx.sentDocs[0].Caption, "Зарегистрировано пользователей: 20") {
+		t.Fatalf("expected a summary in the CSV caption, got %q", ctx.sentDocs[0].Caption)
 	}
 }
 
 func TestQualification_InvalidGradeDoesNotAdvanceOrCallLLM(t *testing.T) {
-	repo := newFakeRepo("SA2026-TEST")
+	repo := newFakeRepo()
 	lm := &fakeLLM{replies: []string{"this reply must stay unused"}}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := New(repo, lm, logger, 8, nil)
@@ -1777,7 +1552,7 @@ func TestQualification_InvalidGradeDoesNotAdvanceOrCallLLM(t *testing.T) {
 	const telegramID = 55
 	ctx := context.Background()
 
-	if err := h.handleStart(newCtx(telegramID, "/start SA2026-TEST", "SA2026-TEST")); err != nil {
+	if err := h.handleSubscription(newCtx(telegramID, ""), subscribedMember); err != nil {
 		t.Fatalf("initial start: %v", err)
 	}
 
@@ -2078,21 +1853,9 @@ func TestFormatFollowupQuestionCapitalizesAndBoldsOnlyQuestion(t *testing.T) {
 	}
 }
 
-func TestCandidateFacingCopyUsesAccurateCountAndFormalAddress(t *testing.T) {
-	if !strings.Contains(instructionMessage, "собраны 174 вопроса") {
-		t.Errorf("instruction is missing the total question count: %q", instructionMessage)
-	}
-	if strings.Contains(instructionMessage, "собраны 58 вопросов") {
-		t.Fatal("instruction still presents only the number of primary questions")
-	}
-	if strings.Contains(instructionMessage, "58 основных") || strings.Contains(instructionMessage, "116 уточняющих") {
-		t.Fatal("instruction exposes the internal primary/follow-up breakdown")
-	}
-
+func TestTrainingCopyPreservesFormalAddress(t *testing.T) {
 	question := &db.QuestionBank{QuestionText: "Что такое API?"}
 	candidateFacing := strings.Join([]string{
-		instructionMessage,
-		currentGradeQuestion,
 		targetGradeQuestion,
 		strongZonesQuestion,
 		weakZonesQuestion,
@@ -2148,7 +1911,7 @@ func TestDeliverFollowupQuestionsUsesTelegramHTMLMode(t *testing.T) {
 
 func TestAskNextQuestion_ExhaustedBankBuildsSummary(t *testing.T) {
 	repo := newFakeRepo()
-	student := &db.Student{TelegramID: 90, Name: "Тест", AccessCode: "SA2026-EMPTY"}
+	student := &db.Student{TelegramID: 90, Name: "Тест"}
 	session := &db.Session{ID: 1, StudentID: student.TelegramID, Status: db.SessionStatusQuestionCycle, Grade: "мидл"}
 	repo.students[student.TelegramID] = student
 	repo.sessions[session.ID] = session
@@ -2160,7 +1923,7 @@ func TestAskNextQuestion_ExhaustedBankBuildsSummary(t *testing.T) {
 		t.Fatalf("askNextQuestion: %v", err)
 	}
 	if got := ctx.sent; len(got) != 2 || !strings.Contains(got[0], "вопросы в банке закончились") ||
-		!strings.Contains(got[1], "Итог без вопросов") || !strings.Contains(got[1], "/start SA2026-EMPTY") {
+		!strings.Contains(got[1], "Итог без вопросов") || !strings.Contains(got[1], "/start") {
 		t.Fatalf("unexpected exhaustion flow: %v", got)
 	}
 	if repo.sessions[session.ID].Status != db.SessionStatusSummary || repo.sessions[session.ID].EndedAt != nil {
@@ -2244,17 +2007,17 @@ func TestRecoverMiddleware_SurvivesPanicWhilePanicHandling(t *testing.T) {
 }
 
 func TestOnError_LogsFullDetailAndSendsFriendlyMessage(t *testing.T) {
-	repo := newFakeRepo("SA2026-TEST")
+	repo := newFakeRepo()
 	logger, logs := newCapturingLogger()
 	h := New(repo, &fakeLLM{}, logger, 8, nil)
 
 	const telegramID = 77
 	ctx := context.Background()
 
-	student, err := repo.CreateStudentIfAccessCodeValid(ctx, telegramID, "Тест", "SA2026-TEST")
-	if err != nil {
+	if err := repo.RegisterStudent(ctx, telegramID, "Тест"); err != nil {
 		t.Fatalf("seed student: %v", err)
 	}
+	student := repo.students[telegramID]
 	session, err := repo.StartSession(ctx, student.TelegramID)
 	if err != nil {
 		t.Fatalf("seed session: %v", err)
@@ -2295,7 +2058,7 @@ func TestOnError_NilContextDoesNotPanic(t *testing.T) {
 }
 
 func TestFsmStatusForLogging(t *testing.T) {
-	repo := newFakeRepo("SA2026-TEST")
+	repo := newFakeRepo()
 	h := New(repo, &fakeLLM{}, slog.New(slog.NewTextHandler(io.Discard, nil)), 8, nil)
 	ctx := context.Background()
 
@@ -2306,10 +2069,10 @@ func TestFsmStatusForLogging(t *testing.T) {
 		t.Errorf("unregistered: got %q", got)
 	}
 
-	student, err := repo.CreateStudentIfAccessCodeValid(ctx, 12345, "Тест", "SA2026-TEST")
-	if err != nil {
+	if err := repo.RegisterStudent(ctx, 12345, "Тест"); err != nil {
 		t.Fatalf("seed student: %v", err)
 	}
+	student := repo.students[12345]
 	if got := h.fsmStatusForLogging(ctx, student.TelegramID); got != "no_active_session" {
 		t.Errorf("no session: got %q", got)
 	}
@@ -2348,9 +2111,7 @@ func TestRegister_AllEndpointsWrappedByRecovery(t *testing.T) {
 	}{
 		{"/start command", "/start"},
 		{"/report command", "/report"},
-		{"/code command", "/code"},
-		{"/codes command", "/codes"},
-		{"/delete_code command", "/delete_code"},
+		{"subscription callback", &btnCheckSubscription},
 		{"/tokens command", "/tokens"},
 		{"restart callback", &btnRestart},
 		{"continue callback", &btnContinue},

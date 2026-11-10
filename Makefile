@@ -1,6 +1,6 @@
 SHELL := /bin/zsh
 
-.PHONY: run config-check db-start db-status migrate test vet build check code questions docker-db-up docker-db-down docker-db-reset
+.PHONY: run config-check db-start db-status migrate test vet build check questions docker-db-up docker-db-down docker-db-reset
 
 run: config-check db-start
 	@echo "Starting bot. Press Ctrl+C to stop it."
@@ -46,9 +46,6 @@ build:
 	go build ./...
 
 check: test vet build
-
-code: migrate
-	go run ./cmd/generate-codes -n 1
 
 questions: migrate
 	go run ./cmd/import-questions -file materials/question_bank.csv

@@ -1,8 +1,8 @@
 # SA HR Bot
 
 Telegram-бот для тренировки технических собеседований системных аналитиков.
-Пользователь регистрируется по одноразовому коду, проходит квалификацию, урок
-КДИР и тематические блоки с обратной связью от LLM.
+В ветке `free` пользователь подтверждает подписку на канал Кати, проходит
+квалификацию, урок КДИР и тематические блоки с обратной связью от LLM.
 Текущий уровень может быть джуном, мидлом или сеньором. Целевой уровень тренировки —
 мидл или сеньор.
 
@@ -12,23 +12,23 @@ Telegram-бот для тренировки технических собесе�
 
 - Go 1.25+;
 - Docker с Docker Compose;
-- токен Telegram-бота;
+- отдельный токен Telegram-бота с правами администратора в канале [@sa_jelatinka](https://t.me/sa_jelatinka);
 - ключ OpenAI API.
 
 ### 1. Настроить окружение
 
 ```bash
-git clone https://github.com/CodeHunt7/sa-hr-bot.git
-cd sa-hr-bot
+git clone --branch free https://github.com/CodeHunt7/sa-hr-bot.git sa-hr-bot-free
+cd sa-hr-bot-free
 cp .env.example .env
 ```
 
-Заполнить в `.env`:
+Заполнить в `.env` токеном второго бота, ключом LLM и адресом его базы:
 
 ```dotenv
 TELEGRAM_BOT_TOKEN=...
 OPENAI_API_KEY=...
-DATABASE_URL=postgres://postgres:localpass@localhost:5432/sahrbot?sslmode=disable
+DATABASE_URL=postgres://postgres:localpass@localhost:5433/sahrbot_free?sslmode=disable
 ```
 
 Опционально:
@@ -47,7 +47,7 @@ make docker-db-up
 ### 3. Запустить бота
 
 ```bash
-make run
+go run ./cmd/bot
 ```
 
 При старте бот сам применяет миграции и загружает активный банк из
@@ -58,19 +58,11 @@ question bank synchronized
 bot starting
 ```
 
-### 4. Создать код и начать тест
+### 4. Проверить вход
 
-В другом окне терминала:
-
-```bash
-make code
-```
-
-Отправить полученный код боту:
-
-```text
-/start SA2026-XXXX
-```
+Отправьте боту `/start` и нажмите «Я готов». Подписчик канала сразу получает
+вступление и первый вопрос. Без подписки бот предлагает открыть канал и
+повторить проверку кнопкой «Я в деле».
 
 Остановить бота — `Ctrl+C`. Остановить локальную БД:
 
@@ -82,8 +74,7 @@ make docker-db-down
 
 ```bash
 make check       # тесты, vet и сборка
-make questions   # вручную синхронизировать банк вопросов
-make code        # создать один код доступа
+go run ./cmd/import-questions -file materials/question_bank.csv
 ```
 
 Подробный сценарий ручной проверки находится в
@@ -97,11 +88,17 @@ make code        # создать один код доступа
 
 ### Первый запуск
 
+Для `free` используйте каталог `/opt/sa-hr-bot-free` и проект Compose
+`sa-hr-bot-free`. PostgreSQL поднимается в собственной сети и пишет в
+отдельный том. В `prod.env` укажите токен второго бота и адрес новой БД.
+`KDIR_VIDEO_FILE_ID` можно оставить пустым для загрузки файла из образа
+или указать ID видео, полученный вторым ботом.
+
 ```bash
 ssh root@IP_СЕРВЕРА
 cd /opt
-git clone https://github.com/CodeHunt7/sa-hr-bot.git
-cd sa-hr-bot
+git clone --branch free https://github.com/CodeHunt7/sa-hr-bot.git sa-hr-bot-free
+cd sa-hr-bot-free
 
 cp compose.prod.example.yaml compose.prod.yaml
 cp prod.env.example prod.env
@@ -115,9 +112,9 @@ nano prod.env
 ```dotenv
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=СГЕНЕРИРОВАННЫЙ_ПАРОЛЬ
-POSTGRES_DB=sahrbot
+POSTGRES_DB=sahrbot_free
 
-DATABASE_URL=postgres://postgres:СГЕНЕРИРОВАННЫЙ_ПАРОЛЬ@postgres:5432/sahrbot?sslmode=disable
+DATABASE_URL=postgres://postgres:СГЕНЕРИРОВАННЫЙ_ПАРОЛЬ@postgres:5432/sahrbot_free?sslmode=disable
 
 TELEGRAM_BOT_TOKEN=...
 OPENAI_API_KEY=...
@@ -134,7 +131,7 @@ SESSION_CYCLE_LIMIT=8
 ```bash
 docker compose -f compose.prod.yaml up -d --wait postgres
 docker compose -f compose.prod.yaml exec postgres \
-  pg_isready -U postgres -d sahrbot
+  pg_isready -U postgres -d sahrbot_free
 docker compose -f compose.prod.yaml up -d --build bot
 docker compose -f compose.prod.yaml logs --tail=100 bot
 ```
@@ -146,21 +143,21 @@ docker compose -f compose.prod.yaml logs --tail=100 bot
 
 Секреты, настоящий IP сервера, `prod.env` и пароли нельзя сохранять в Git.
 
-### Обновить бота после изменений в `main`
+### Обновить бота после изменений в `free`
 
 Перед обновлением, которое заменяет банк вопросов или меняет миграции, сделать резервную копию БД:
 
 ```bash
-cd /opt/sa-hr-bot
+cd /opt/sa-hr-bot-free
 docker compose -f compose.prod.yaml exec -T postgres \
   sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"' > backup_$(date +%F).sql
 ```
 
 ```bash
 ssh root@IP_СЕРВЕРА
-cd /opt/sa-hr-bot
+cd /opt/sa-hr-bot-free
 
-git pull --ff-only origin main
+git pull --ff-only origin free
 docker compose -f compose.prod.yaml up -d --build bot
 docker compose -f compose.prod.yaml logs --tail=100 bot
 ```
@@ -174,10 +171,16 @@ docker compose -f compose.prod.yaml build --no-cache bot
 docker compose -f compose.prod.yaml up -d --force-recreate bot
 ```
 
+Для отката приложения выберите предыдущий проверенный коммит ветки
+`free` в том же каталоге и пересоберите только сервис `bot`. Для отката
+изменений схемы отдельно проверьте совместимость и резервную копию. Миграция
+регистрации сохраняет старые данные. PostgreSQL отклонит её откат после
+появления пользователей, зарегистрированных без кода.
+
 ### Состояние и логи
 
 ```bash
-cd /opt/sa-hr-bot
+cd /opt/sa-hr-bot-free
 
 docker compose -f compose.prod.yaml ps
 docker compose -f compose.prod.yaml logs --tail=100 bot
@@ -202,21 +205,10 @@ docker compose -f compose.prod.yaml up -d --force-recreate bot
 
 Команда `/admin` показывает справку. Команды доступны только администраторам:
 
-- `/code` или `/code 5` — создать от 1 до 20 одноразовых кодов;
-- `/codes` — показать свободные, активные и истёкшие коды и даты доступа;
-- `/delete_code SA2026-XXXX` — удалить неиспользованный код;
-- `/tokens SA2026-XXXX` — посмотреть срок доступа и расход токенов пользователя;
-- `/report` — общий отчёт по пользователям, срокам доступа, кодам и токенам.
-
-Использованный код удалить нельзя: он связан с пользователем и историей
-тренировок. Код даёт доступ на два календарных месяца с момента первого
-использования. После окончания срока профиль, ответы и текущая сессия сохраняются;
-участник может активировать новый свободный код командой `/start НОВЫЙ_КОД` и
-продолжить с сохранённого места.
-
-При первом обновлении на версию со сроком доступа миграция рассчитает даты уже
-использованных кодов от `students.created_at`. Поэтому пользователям, которые
-зарегистрировались больше двух месяцев назад, сразу понадобится новый код.
+- `/tokens TELEGRAM_ID` показывает число вызовов LLM и входные, выходные,
+  суммарные и кешированные токены пользователя.
+- `/report` показывает число зарегистрированных пользователей, общий расход,
+  число вызовов и разбивку по пользователям. Длинный отчёт приходит в CSV.
 
 ## Стек
 

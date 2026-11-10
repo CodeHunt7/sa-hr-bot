@@ -58,21 +58,9 @@ const (
 
 // Student is a course participant identified by their Telegram account.
 type Student struct {
-	TelegramID        int64     `db:"telegram_id"`
-	Name              string    `db:"name"`
-	AccessCode        string    `db:"access_code"`
-	CreatedAt         time.Time `db:"created_at"`
-	AccessActivatedAt time.Time `db:"access_activated_at"`
-	AccessExpiresAt   time.Time `db:"access_expires_at"`
-}
-
-// AccessCode is a single-use invite code that gates bot registration.
-type AccessCode struct {
-	Code        string     `db:"code"`
-	IsUsed      bool       `db:"is_used"`
-	StudentID   *int64     `db:"student_id"`
-	ActivatedAt *time.Time `db:"activated_at"`
-	ExpiresAt   *time.Time `db:"expires_at"`
+	TelegramID int64     `db:"telegram_id"`
+	Name       string    `db:"name"`
+	CreatedAt  time.Time `db:"created_at"`
 }
 
 // Session is one mock-interview run for a student.
@@ -193,7 +181,6 @@ type SessionSummary struct {
 type StudentReport struct {
 	TelegramID        int64
 	Name              string
-	AccessCode        string
 	CompletedSessions int
 	LastSessionAt     *time.Time // nil if the student never started a session
 	Calls             int64
@@ -201,22 +188,4 @@ type StudentReport struct {
 	CompletionTokens  int64
 	TotalTokens       int64
 	CachedTokens      int64
-	AccessActivatedAt time.Time
-	AccessExpiresAt   time.Time
-}
-
-// TokenUsageReport is the admin-facing aggregate for one access code. Codes
-// that have not been used yet have no student identity and zero usage.
-type TokenUsageReport struct {
-	Code             string
-	IsUsed           bool
-	StudentID        *int64
-	StudentName      string
-	Calls            int64
-	PromptTokens     int64
-	CompletionTokens int64
-	TotalTokens      int64
-	CachedTokens     int64
-	ActivatedAt      *time.Time
-	ExpiresAt        *time.Time
 }
